@@ -33,3 +33,4 @@ Directories are scanned recursively for `.zig` files.
 | Z012 | Public function exposes private type |
 | Z013 | Unused import |
 | Z014 | Error set names should be PascalCase |
+| Z015 | Public function exposes private error set |

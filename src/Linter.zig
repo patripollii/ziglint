@@ -398,6 +398,16 @@ fn checkTypeNodeForPrivateWithGenerics(
     fn_proto: Ast.full.FnProto,
     generic_params: []const []const u8,
 ) void {
+    self.checkTypeNodeForPrivateImpl(type_node, fn_proto, generic_params, false);
+}
+
+fn checkTypeNodeForPrivateImpl(
+    self: *Linter,
+    type_node: Ast.Node.Index,
+    fn_proto: Ast.full.FnProto,
+    generic_params: []const []const u8,
+    is_error_position: bool,
+) void {
     const tag = self.tree.nodeTag(type_node);
 
     switch (tag) {
@@ -408,26 +418,27 @@ fn checkTypeNodeForPrivateWithGenerics(
                 if (std.mem.eql(u8, type_name, gp)) return;
             }
             if (self.isPrivateTypeRef(type_name)) {
-                self.reportPrivateType(fn_proto, type_name);
+                self.reportPrivateType(fn_proto, type_name, is_error_position);
             }
         },
         .optional_type => {
             const child = self.tree.nodeData(type_node).node;
-            self.checkTypeNodeForPrivateWithGenerics(child, fn_proto, generic_params);
+            self.checkTypeNodeForPrivateImpl(child, fn_proto, generic_params, is_error_position);
         },
         .error_union => {
             const data = self.tree.nodeData(type_node).node_and_node;
-            self.checkTypeNodeForPrivateWithGenerics(data[0], fn_proto, generic_params);
-            self.checkTypeNodeForPrivateWithGenerics(data[1], fn_proto, generic_params);
+            self.checkTypeNodeForPrivateImpl(data[0], fn_proto, generic_params, true);
+            self.checkTypeNodeForPrivateImpl(data[1], fn_proto, generic_params, false);
         },
         else => {},
     }
 }
 
-fn reportPrivateType(self: *Linter, fn_proto: Ast.full.FnProto, type_name: []const u8) void {
+fn reportPrivateType(self: *Linter, fn_proto: Ast.full.FnProto, type_name: []const u8, is_error: bool) void {
     const name_token = fn_proto.name_token orelse return;
     const loc = self.tree.tokenLocation(0, name_token);
-    self.report(loc, .Z012, type_name);
+    const rule: rules.Rule = if (is_error) .Z015 else .Z012;
+    self.report(loc, rule, type_name);
 }
 
 fn visitNode(self: *Linter, node: Ast.Node.Index) void {
@@ -1485,7 +1496,7 @@ test "Z012: pub fn returning error union with private type" {
     try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
 }
 
-test "Z012: pub fn returning private error set" {
+test "Z015: pub fn returning private error set" {
     var linter: Linter = .init(std.testing.allocator,
         \\const Oom = error{OutOfMemory};
         \\pub fn doThing() Oom!void {}
@@ -1493,7 +1504,7 @@ test "Z012: pub fn returning private error set" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnostics.items.len);
-    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+    try std.testing.expectEqual(rules.Rule.Z015, linter.diagnostics.items[0].rule);
 }
 
 test "Z012: pub fn returning public type is ok" {
