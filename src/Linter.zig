@@ -53,6 +53,8 @@ pub fn lint(self: *Linter) void {
     self.checkParseErrors();
     if (self.tree.errors.len > 0) return;
 
+    self.checkCommentDividers();
+
     for (self.tree.rootDecls()) |node| {
         self.visitNode(node);
     }
@@ -63,6 +65,49 @@ fn checkParseErrors(self: *Linter) void {
         const loc = self.tree.tokenLocation(0, err.token);
         self.report(loc, .Z003, "");
     }
+}
+
+fn checkCommentDividers(self: *Linter) void {
+    var line_num: usize = 0;
+    var line_start: usize = 0;
+
+    for (self.source, 0..) |c, i| {
+        if (c == '\n') {
+            const line = self.source[line_start..i];
+            if (isDividerComment(line)) {
+                self.report(.{ .line = line_num, .column = 0, .line_start = line_start, .line_end = i }, .Z008, "");
+            }
+            line_num += 1;
+            line_start = i + 1;
+        }
+    }
+
+    // Check last line if no trailing newline
+    if (line_start < self.source.len) {
+        const line = self.source[line_start..];
+        if (isDividerComment(line)) {
+            self.report(.{ .line = line_num, .column = 0, .line_start = line_start, .line_end = self.source.len }, .Z008, "");
+        }
+    }
+}
+
+fn isDividerComment(line: []const u8) bool {
+    const trimmed = std.mem.trimLeft(u8, line, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "//")) return false;
+
+    const after_slashes = std.mem.trimLeft(u8, trimmed[2..], " ");
+    if (after_slashes.len < 3) return false;
+
+    // Check if mostly one repeated character
+    const first = after_slashes[0];
+    if (first != '=' and first != '-' and first != '*' and first != '#') return false;
+
+    var count: usize = 0;
+    for (after_slashes) |ch| {
+        if (ch == first) count += 1;
+    }
+
+    return count * 100 / after_slashes.len >= 80;
 }
 
 fn visitNode(self: *Linter, node: Ast.Node.Index) void {
@@ -317,10 +362,6 @@ fn report(self: *Linter, loc: Ast.Location, rule: rules.Rule, context: []const u
     }) catch {};
 }
 
-// =============================================================================
-// Z001: function names should be camelCase
-// =============================================================================
-
 test "Z001: detect PascalCase function" {
     var linter: Linter = .init(std.testing.allocator, "fn MyFunc() void {}", "test.zig");
     defer linter.deinit();
@@ -357,10 +398,6 @@ test "Z001: allow single lowercase letter" {
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
 }
 
-// =============================================================================
-// Z002: unused variable has a value
-// =============================================================================
-
 test "Z002: detect unused variable with value" {
     var linter: Linter = .init(std.testing.allocator, "fn foo() void { const _x = 1; }", "test.zig");
     defer linter.deinit();
@@ -387,10 +424,6 @@ test "Z002: allow double underscore __" {
     }
 }
 
-// =============================================================================
-// Z003: parse error
-// =============================================================================
-
 test "Z003: detect parse error" {
     var linter: Linter = .init(std.testing.allocator, "const x = ", "test.zig");
     defer linter.deinit();
@@ -405,10 +438,6 @@ test "Z003: valid code no parse error" {
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
 }
-
-// =============================================================================
-// Z004: prefer const foo: Foo = .{} over const foo = Foo{}
-// =============================================================================
 
 test "Z004: detect explicit struct init" {
     var linter: Linter = .init(std.testing.allocator, "const Foo = struct {}; fn bar() void { const x = Foo{}; _ = x; }", "test.zig");
@@ -440,10 +469,6 @@ test "Z004: allow anonymous struct init with fields" {
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
 }
 
-// =============================================================================
-// Z005: type functions should be PascalCase
-// =============================================================================
-
 test "Z005: detect lowercase type function" {
     var linter: Linter = .init(std.testing.allocator, "fn myType() type { return struct {}; }", "test.zig");
     defer linter.deinit();
@@ -473,10 +498,6 @@ test "Z005: allow PascalCase generic type function" {
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
 }
-
-// =============================================================================
-// Z006: variables should be snake_case
-// =============================================================================
 
 test "Z006: detect camelCase variable" {
     var linter: Linter = .init(std.testing.allocator, "fn foo() void { const myVar = 1; _ = myVar; }", "test.zig");
@@ -516,10 +537,6 @@ test "Z006: allow underscore prefix" {
         try std.testing.expect(d.rule != rules.Rule.Z006);
     }
 }
-
-// =============================================================================
-// Z006: type alias exemptions
-// =============================================================================
 
 test "Z006: allow type alias with @This()" {
     var linter: Linter = .init(std.testing.allocator, "const MyType = @This();", "test.zig");
@@ -592,10 +609,6 @@ test "Z006: detect snake_case identifier assignment" {
     try std.testing.expectEqual(1, linter.diagnostics.items.len);
     try std.testing.expectEqual(rules.Rule.Z006, linter.diagnostics.items[0].rule);
 }
-
-// =============================================================================
-// Inline ignore comments
-// =============================================================================
 
 test "inline ignore: single rule" {
     var linter: Linter = .init(std.testing.allocator, "fn foo() void { const myVar = 1; _ = myVar; } // ziglint-ignore: Z006", "test.zig");
@@ -675,10 +688,6 @@ test "inline ignore: multiple preceding with other comments" {
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
 }
 
-// =============================================================================
-// Duplicate import (Z007)
-// =============================================================================
-
 test "Z007: duplicate import" {
     var linter: Linter = .init(std.testing.allocator,
         \\const std = @import("std");
@@ -709,4 +718,35 @@ test "Z007: multiple duplicates" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(2, linter.diagnostics.items.len);
+}
+
+test "Z008: detect comment divider with equals" {
+    var linter: Linter = .init(std.testing.allocator, "// ========================================", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z008, linter.diagnostics.items[0].rule);
+}
+
+test "Z008: detect comment divider with dashes" {
+    var linter: Linter = .init(std.testing.allocator, "// ----------------------------------------", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z008, linter.diagnostics.items[0].rule);
+}
+
+test "Z008: detect short separators" {
+    var linter: Linter = .init(std.testing.allocator, "// ----", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z008, linter.diagnostics.items[0].rule);
+}
+
+test "Z008: allow normal comments" {
+    var linter: Linter = .init(std.testing.allocator, "// This is a normal comment", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
 }
