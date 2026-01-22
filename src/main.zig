@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Linter = @import("Linter.zig");
+const ModuleGraph = @import("ModuleGraph.zig");
 
 pub const Config = struct {
     root_source: ?[]const u8 = null,
@@ -84,12 +85,15 @@ fn runSemanticMode(
     explicit_lib_path: ?[]const u8,
     writer: *std.Io.Writer,
 ) !u8 {
-    const zig_lib_path = explicit_lib_path orelse try detectZigLibPath(allocator, writer) orelse {
-        try writer.writeAll("error: could not detect zig lib path. Use --zig-lib-path to specify.\n");
+    const zig_lib_path = explicit_lib_path orelse try detectZigLibPath(allocator, writer);
+
+    var graph = ModuleGraph.init(allocator, root_source, zig_lib_path) catch |err| {
+        try writer.print("error: could not build module graph: {}\n", .{err});
         return 1;
     };
+    defer graph.deinit();
 
-    try writer.print("semantic mode: root={s} lib={s}\n", .{ root_source, zig_lib_path });
+    try writer.print("semantic mode: parsed {} modules from root={s}\n", .{ graph.moduleCount(), root_source });
     return 0;
 }
 
@@ -258,6 +262,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
 
 test {
     _ = Linter;
+    _ = ModuleGraph;
     _ = @import("rules.zig");
 }
 
