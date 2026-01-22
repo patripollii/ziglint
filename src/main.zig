@@ -264,6 +264,7 @@ test {
     _ = Linter;
     _ = ModuleGraph;
     _ = @import("rules.zig");
+    _ = @import("doc_comments.zig");
 }
 
 test "parseLibDirFromZigEnv" {
