@@ -17,6 +17,7 @@ seen_imports: std.StringHashMapUnmanaged(Ast.TokenIndex),
 type_resolver: ?*TypeResolver = null,
 module_path: ?[]const u8 = null,
 allocated_contexts: std.ArrayListUnmanaged([]const u8) = .empty,
+public_types: std.StringHashMapUnmanaged(void) = .empty,
 
 pub const Diagnostic = struct {
     path: []const u8,
@@ -75,6 +76,7 @@ pub fn deinit(self: *Linter) void {
     self.tree.deinit(self.allocator);
     self.diagnostics.deinit(self.allocator);
     self.seen_imports.deinit(self.allocator);
+    self.public_types.deinit(self.allocator);
 }
 
 pub fn lint(self: *Linter) void {
@@ -83,6 +85,7 @@ pub fn lint(self: *Linter) void {
 
     self.checkCommentDividers();
     self.checkFileAsStruct();
+    self.buildPublicTypesMap();
 
     for (self.tree.rootDecls()) |node| {
         self.visitNode(node);
@@ -164,6 +167,158 @@ fn isDividerComment(line: []const u8) bool {
     return count * 100 / after_slashes.len >= 80;
 }
 
+fn buildPublicTypesMap(self: *Linter) void {
+    for (self.tree.rootDecls()) |node| {
+        const tag = self.tree.nodeTag(node);
+        switch (tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = self.tree.fullVarDecl(node) orelse continue;
+                if (!self.isPublicDecl(node)) continue;
+                if (!self.isTypeDecl(var_decl)) continue;
+
+                const name_token = var_decl.ast.mut_token + 1;
+                const name = self.tree.tokenSlice(name_token);
+                self.public_types.put(self.allocator, name, {}) catch {};
+            },
+            else => {},
+        }
+    }
+}
+
+fn isPublicDecl(self: *Linter, node: Ast.Node.Index) bool {
+    const main_token = self.tree.nodeMainToken(node);
+    if (main_token == 0) return false;
+    const prev_token = main_token - 1;
+    const prev_slice = self.tree.tokenSlice(prev_token);
+    return std.mem.eql(u8, prev_slice, "pub");
+}
+
+fn isTypeDecl(self: *Linter, var_decl: Ast.full.VarDecl) bool {
+    const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+    const tag = self.tree.nodeTag(init_node);
+    return switch (tag) {
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => true,
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
+            const token = self.tree.tokenSlice(self.tree.nodeMainToken(init_node));
+            break :blk std.mem.eql(u8, token, "@Type");
+        },
+        else => false,
+    };
+}
+
+fn isPrivateTypeRef(self: *Linter, name: []const u8) bool {
+    if (!isPascalCase(name)) return false;
+    if (isBuiltinType(name)) return false;
+    if (self.public_types.contains(name)) return false;
+    return true;
+}
+
+fn isBuiltinType(name: []const u8) bool {
+    const builtins = [_][]const u8{
+        "u8",           "u16",            "u32",  "u64",      "u128",    "usize",
+        "i8",           "i16",            "i32",  "i64",      "i128",    "isize",
+        "f16",          "f32",            "f64",  "f80",      "f128",    "bool",
+        "void",         "noreturn",       "type", "anyerror", "anytype", "anyframe",
+        "comptime_int", "comptime_float",
+    };
+    for (builtins) |b| {
+        if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
+}
+
+fn checkExposedPrivateType(self: *Linter, node: Ast.Node.Index) void {
+    var buf: [1]Ast.Node.Index = undefined;
+    const fn_proto = self.tree.fullFnProto(&buf, node) orelse return;
+
+    if (!self.isPublicDecl(node)) return;
+
+    // Collect generic type parameter names
+    var generic_params: [16][]const u8 = undefined;
+    var generic_count: usize = 0;
+    var it = fn_proto.iterate(&self.tree);
+    while (it.next()) |param| {
+        const type_node = param.type_expr orelse continue;
+        if (self.tree.nodeTag(type_node) == .identifier) {
+            const type_name = self.tree.tokenSlice(self.tree.nodeMainToken(type_node));
+            if (std.mem.eql(u8, type_name, "type")) {
+                if (param.name_token) |name_tok| {
+                    if (generic_count < 16) {
+                        generic_params[generic_count] = self.tree.tokenSlice(name_tok);
+                        generic_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Check return type
+    if (fn_proto.ast.return_type.unwrap()) |ret_node| {
+        self.checkTypeNodeForPrivateWithGenerics(ret_node, fn_proto, generic_params[0..generic_count]);
+    }
+
+    // Check parameter types
+    var it2 = fn_proto.iterate(&self.tree);
+    while (it2.next()) |param| {
+        const type_node = param.type_expr orelse continue;
+        // Skip generic parameters (comptime T: type)
+        if (self.tree.nodeTag(type_node) == .identifier) {
+            const type_name = self.tree.tokenSlice(self.tree.nodeMainToken(type_node));
+            if (std.mem.eql(u8, type_name, "type")) continue;
+        }
+        self.checkTypeNodeForPrivateWithGenerics(type_node, fn_proto, generic_params[0..generic_count]);
+    }
+}
+
+fn checkTypeNodeForPrivateWithGenerics(
+    self: *Linter,
+    type_node: Ast.Node.Index,
+    fn_proto: Ast.full.FnProto,
+    generic_params: []const []const u8,
+) void {
+    const tag = self.tree.nodeTag(type_node);
+
+    switch (tag) {
+        .identifier => {
+            const type_name = self.tree.tokenSlice(self.tree.nodeMainToken(type_node));
+            // Skip generic type parameters
+            for (generic_params) |gp| {
+                if (std.mem.eql(u8, type_name, gp)) return;
+            }
+            if (self.isPrivateTypeRef(type_name)) {
+                self.reportPrivateType(fn_proto, type_name);
+            }
+        },
+        .optional_type => {
+            const child = self.tree.nodeData(type_node).node;
+            self.checkTypeNodeForPrivateWithGenerics(child, fn_proto, generic_params);
+        },
+        .error_union => {
+            const data = self.tree.nodeData(type_node).node_and_node;
+            self.checkTypeNodeForPrivateWithGenerics(data[1], fn_proto, generic_params);
+        },
+        else => {},
+    }
+}
+
+fn reportPrivateType(self: *Linter, fn_proto: Ast.full.FnProto, type_name: []const u8) void {
+    const name_token = fn_proto.name_token orelse return;
+    const loc = self.tree.tokenLocation(0, name_token);
+    self.report(loc, .Z012, type_name);
+}
+
 fn visitNode(self: *Linter, node: Ast.Node.Index) void {
     const tag = self.tree.nodeTag(node);
 
@@ -226,6 +381,8 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
             self.report(loc, .Z001, name);
         }
     }
+
+    self.checkExposedPrivateType(node);
 }
 
 fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
@@ -285,14 +442,15 @@ fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.To
 
 fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     const return_expr = self.tree.nodeData(node).opt_node.unwrap() orelse return;
-    self.checkRedundantType(return_expr);
+    self.checkRedundantType(return_expr, true);
 }
 
 fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
     var buf: [1]Ast.Node.Index = undefined;
     const call = self.tree.fullCall(&buf, node) orelse return;
     for (call.ast.params) |arg| {
-        self.checkRedundantType(arg);
+        // Don't check field_access in call args - can't distinguish type params from enum values
+        self.checkRedundantType(arg, false);
     }
 }
 
@@ -340,7 +498,7 @@ fn containsDeprecated(text: []const u8) bool {
     return false;
 }
 
-fn checkRedundantType(self: *Linter, node: Ast.Node.Index) void {
+fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool) void {
     const tag = self.tree.nodeTag(node);
 
     if (isExplicitStructInit(tag)) {
@@ -351,7 +509,7 @@ fn checkRedundantType(self: *Linter, node: Ast.Node.Index) void {
         const type_name = self.tree.tokenSlice(type_token);
         const loc = self.tree.tokenLocation(0, type_token);
         self.report(loc, .Z010, type_name);
-    } else if (tag == .field_access) {
+    } else if (check_field_access and tag == .field_access) {
         // Only flag if the LHS is a PascalCase identifier (likely a type/enum)
         const data = self.tree.nodeData(node).node_and_token;
         const lhs = data[0];
@@ -1079,4 +1237,94 @@ test "containsDeprecated" {
     try std.testing.expect(containsDeprecated("This is DEPRECATED"));
     try std.testing.expect(!containsDeprecated("This function is useful"));
     try std.testing.expect(!containsDeprecated("deprecat")); // too short
+}
+
+test "Z012: pub fn returning private type" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\pub fn getPrivate() Private { return .{}; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z012: pub fn accepting private type parameter" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\pub fn usePrivate(p: Private) void { _ = p; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z012: pub fn returning optional private type" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\pub fn maybePrivate() ?Private { return null; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z012: pub fn returning error union with private type" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\pub fn getPrivateOrError() !Private { return .{}; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z012: pub fn returning public type is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Public = struct {};
+        \\pub fn getPublic() Public { return .{}; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning builtin type is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn getValue() u32 { return 42; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: non-pub fn returning private type is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Private = struct {};
+        \\fn getPrivate() Private { return .{}; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: generic parameter with comptime T: type is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn genericFn(comptime T: type) T { return undefined; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
 }
