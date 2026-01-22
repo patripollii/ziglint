@@ -18,6 +18,14 @@ type_resolver: ?*TypeResolver = null,
 module_path: ?[]const u8 = null,
 allocated_contexts: std.ArrayListUnmanaged([]const u8) = .empty,
 public_types: std.StringHashMapUnmanaged(void) = .empty,
+import_bindings: std.StringHashMapUnmanaged(ImportInfo) = .empty,
+used_identifiers: std.StringHashMapUnmanaged(void) = .empty,
+
+const ImportInfo = struct {
+    name_token: Ast.TokenIndex,
+    is_pub: bool,
+    is_discard: bool,
+};
 
 pub const Diagnostic = struct {
     path: []const u8,
@@ -77,6 +85,8 @@ pub fn deinit(self: *Linter) void {
     self.diagnostics.deinit(self.allocator);
     self.seen_imports.deinit(self.allocator);
     self.public_types.deinit(self.allocator);
+    self.import_bindings.deinit(self.allocator);
+    self.used_identifiers.deinit(self.allocator);
 }
 
 pub fn lint(self: *Linter) void {
@@ -86,9 +96,38 @@ pub fn lint(self: *Linter) void {
     self.checkCommentDividers();
     self.checkFileAsStruct();
     self.buildPublicTypesMap();
+    self.collectAllIdentifiers();
 
     for (self.tree.rootDecls()) |node| {
         self.visitNode(node);
+    }
+
+    self.checkUnusedImports();
+}
+
+fn collectAllIdentifiers(self: *Linter) void {
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const tag = self.tree.nodeTag(node);
+        switch (tag) {
+            .identifier => {
+                const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+                self.used_identifiers.put(self.allocator, name, {}) catch {};
+            },
+            .field_access => {
+                // Walk field_access chain to find root identifier
+                var current = node;
+                while (self.tree.nodeTag(current) == .field_access) {
+                    const data = self.tree.nodeData(current).node_and_token;
+                    current = data[0];
+                }
+                if (self.tree.nodeTag(current) == .identifier) {
+                    const name = self.tree.tokenSlice(self.tree.nodeMainToken(current));
+                    self.used_identifiers.put(self.allocator, name, {}) catch {};
+                }
+            },
+            else => {},
+        }
     }
 }
 
@@ -96,6 +135,30 @@ fn checkParseErrors(self: *Linter) void {
     for (self.tree.errors) |err| {
         const loc = self.tree.tokenLocation(0, err.token);
         self.report(loc, .Z003, "");
+    }
+}
+
+fn checkUnusedImports(self: *Linter) void {
+    var it = self.import_bindings.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const info = entry.value_ptr.*;
+
+        // Skip pub re-exports - they're intentionally exposed
+        if (info.is_pub) continue;
+
+        // Discarded imports `_ = @import(...)` are always unused
+        if (info.is_discard) {
+            const loc = self.tree.tokenLocation(0, info.name_token);
+            self.report(loc, .Z013, name);
+            continue;
+        }
+
+        // Check if the bound name is used elsewhere
+        if (!self.used_identifiers.contains(name)) {
+            const loc = self.tree.tokenLocation(0, info.name_token);
+            self.report(loc, .Z013, name);
+        }
     }
 }
 
@@ -222,7 +285,18 @@ fn isPrivateTypeRef(self: *Linter, name: []const u8) bool {
     if (!isPascalCase(name)) return false;
     if (isBuiltinType(name)) return false;
     if (self.public_types.contains(name)) return false;
+    // Don't flag Self type (type matching filename for file-as-struct pattern)
+    if (self.isSelfType(name)) return false;
     return true;
+}
+
+fn isSelfType(self: *Linter, name: []const u8) bool {
+    const basename = std.fs.path.basename(self.path);
+    const stem = if (std.mem.endsWith(u8, basename, ".zig"))
+        basename[0 .. basename.len - 4]
+    else
+        basename;
+    return std.mem.eql(u8, name, stem);
 }
 
 fn isBuiltinType(name: []const u8) bool {
@@ -413,6 +487,26 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
     }
 
     self.checkDupeImport(var_decl, name_token);
+    self.trackImportBinding(node, var_decl, name_token);
+}
+
+fn trackImportBinding(self: *Linter, node: Ast.Node.Index, var_decl: Ast.full.VarDecl, name_token: Ast.TokenIndex) void {
+    const init_node = var_decl.ast.init_node.unwrap() orelse return;
+
+    // Check if this is a @import call
+    const main_token = self.tree.nodeMainToken(init_node);
+    const builtin_name = self.tree.tokenSlice(main_token);
+    if (!std.mem.eql(u8, builtin_name, "@import")) return;
+
+    const name = self.tree.tokenSlice(name_token);
+    const is_discard = std.mem.eql(u8, name, "_");
+    const is_pub = self.isPublicDecl(node);
+
+    self.import_bindings.put(self.allocator, name, .{
+        .name_token = name_token,
+        .is_pub = is_pub,
+        .is_discard = is_discard,
+    }) catch {};
 }
 
 fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.TokenIndex) void {
@@ -849,7 +943,9 @@ test "Z006: allow type alias with @import()" {
     var linter: Linter = .init(std.testing.allocator, "const Foo = @import(\"foo.zig\");", "test.zig");
     defer linter.deinit();
     linter.lint();
-    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z006);
+    }
 }
 
 test "Z006: allow type alias with @Type()" {
@@ -992,21 +1088,30 @@ test "Z007: duplicate import" {
     var linter: Linter = .init(std.testing.allocator,
         \\const std = @import("std");
         \\const std2 = @import("std");
+        \\const x = std;
+        \\const y = std2;
     , "test.zig");
     defer linter.deinit();
     linter.lint();
-    try std.testing.expectEqual(1, linter.diagnostics.items.len);
-    try std.testing.expectEqual(rules.Rule.Z007, linter.diagnostics.items[0].rule);
+    var z007_count: usize = 0;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z007) z007_count += 1;
+    }
+    try std.testing.expectEqual(1, z007_count);
 }
 
 test "Z007: different imports allowed" {
     var linter: Linter = .init(std.testing.allocator,
         \\const std = @import("std");
         \\const foo = @import("foo.zig");
+        \\const x = std;
+        \\const y = foo;
     , "test.zig");
     defer linter.deinit();
     linter.lint();
-    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z007);
+    }
 }
 
 test "Z007: multiple duplicates" {
@@ -1014,10 +1119,17 @@ test "Z007: multiple duplicates" {
         \\const std = @import("std");
         \\const std2 = @import("std");
         \\const std3 = @import("std");
+        \\const x = std;
+        \\const y = std2;
+        \\const z = std3;
     , "test.zig");
     defer linter.deinit();
     linter.lint();
-    try std.testing.expectEqual(2, linter.diagnostics.items.len);
+    var z007_count: usize = 0;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z007) z007_count += 1;
+    }
+    try std.testing.expectEqual(2, z007_count);
 }
 
 test "Z008: detect comment divider with equals" {
@@ -1326,5 +1438,73 @@ test "Z012: generic parameter with comptime T: type is ok" {
     linter.lint();
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z013: detect unused import" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const foo = @import("foo.zig");
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z013, linter.diagnostics.items[0].rule);
+}
+
+test "Z013: import used via field access is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const mem = std.mem;
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z013);
+    }
+}
+
+test "Z013: discarded import at root should warn" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const _ = @import("foo.zig");
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z013, linter.diagnostics.items[0].rule);
+}
+
+test "Z013: discarded import in test block is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\test {
+        \\    _ = @import("foo.zig");
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z013);
+    }
+}
+
+test "Z013: pub re-export is not unused" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const foo = @import("foo.zig");
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z013);
+    }
+}
+
+test "Z013: import used as identifier is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const foo = @import("foo.zig");
+        \\const bar = foo;
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z013);
     }
 }

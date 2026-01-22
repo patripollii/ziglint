@@ -13,6 +13,7 @@ pub const Rule = enum(u16) {
     Z010 = 10,
     Z011 = 11,
     Z012 = 12,
+    Z013 = 13,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -32,6 +33,7 @@ pub const Rule = enum(u16) {
             .Z010 => try writer.print("redundant type specifier; prefer '.{s}' over explicit type", .{context}),
             .Z011 => try writer.print("{s}", .{context}),
             .Z012 => try writer.print("public function exposes private type '{s}'", .{context}),
+            .Z013 => try writer.print("unused import '{s}'", .{context}),
         }
     }
 };
