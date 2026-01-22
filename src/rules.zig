@@ -14,6 +14,7 @@ pub const Rule = enum(u16) {
     Z011 = 11,
     Z012 = 12,
     Z013 = 13,
+    Z014 = 14,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -34,6 +35,7 @@ pub const Rule = enum(u16) {
             .Z011 => try writer.print("{s}", .{context}),
             .Z012 => try writer.print("public function exposes private type '{s}'", .{context}),
             .Z013 => try writer.print("unused import '{s}'", .{context}),
+            .Z014 => try writer.print("error set '{s}' should be PascalCase", .{context}),
         }
     }
 };

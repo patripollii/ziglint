@@ -18,6 +18,7 @@ type_resolver: ?*TypeResolver = null,
 module_path: ?[]const u8 = null,
 allocated_contexts: std.ArrayListUnmanaged([]const u8) = .empty,
 public_types: std.StringHashMapUnmanaged(void) = .empty,
+imported_types: std.StringHashMapUnmanaged(void) = .empty,
 import_bindings: std.StringHashMapUnmanaged(ImportInfo) = .empty,
 used_identifiers: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -85,6 +86,7 @@ pub fn deinit(self: *Linter) void {
     self.diagnostics.deinit(self.allocator);
     self.seen_imports.deinit(self.allocator);
     self.public_types.deinit(self.allocator);
+    self.imported_types.deinit(self.allocator);
     self.import_bindings.deinit(self.allocator);
     self.used_identifiers.deinit(self.allocator);
 }
@@ -236,16 +238,49 @@ fn buildPublicTypesMap(self: *Linter) void {
         switch (tag) {
             .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
                 const var_decl = self.tree.fullVarDecl(node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                const name = self.tree.tokenSlice(name_token);
+
+                // Track imported types (field access ending in PascalCase, e.g., std.mem.Allocator)
+                if (self.isImportedType(var_decl)) {
+                    self.imported_types.put(self.allocator, name, {}) catch {};
+                    continue;
+                }
+
                 if (!self.isPublicDecl(node)) continue;
                 if (!self.isTypeDecl(var_decl)) continue;
 
-                const name_token = var_decl.ast.mut_token + 1;
-                const name = self.tree.tokenSlice(name_token);
                 self.public_types.put(self.allocator, name, {}) catch {};
             },
             else => {},
         }
     }
+}
+
+fn isImportedType(self: *Linter, var_decl: Ast.full.VarDecl) bool {
+    const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+
+    // Use type resolver if available
+    if (self.type_resolver) |resolver| {
+        if (self.module_path) |mod_path| {
+            const type_info = resolver.typeOf(mod_path, init_node);
+            return switch (type_info) {
+                .type_type, .std_type, .user_type => true,
+                else => false,
+            };
+        }
+    }
+
+    // Fallback: check if it's a field access ending in PascalCase
+    const tag = self.tree.nodeTag(init_node);
+    return switch (tag) {
+        .field_access => blk: {
+            const data = self.tree.nodeData(init_node).node_and_token;
+            const field_name = self.tree.tokenSlice(data[1]);
+            break :blk isPascalCase(field_name);
+        },
+        else => false,
+    };
 }
 
 fn isPublicDecl(self: *Linter, node: Ast.Node.Index) bool {
@@ -285,6 +320,7 @@ fn isPrivateTypeRef(self: *Linter, name: []const u8) bool {
     if (!isPascalCase(name)) return false;
     if (isBuiltinType(name)) return false;
     if (self.public_types.contains(name)) return false;
+    if (self.imported_types.contains(name)) return false;
     // Don't flag Self type (type matching filename for file-as-struct pattern)
     if (self.isSelfType(name)) return false;
     return true;
@@ -381,6 +417,7 @@ fn checkTypeNodeForPrivateWithGenerics(
         },
         .error_union => {
             const data = self.tree.nodeData(type_node).node_and_node;
+            self.checkTypeNodeForPrivateWithGenerics(data[0], fn_proto, generic_params);
             self.checkTypeNodeForPrivateWithGenerics(data[1], fn_proto, generic_params);
         },
         else => {},
@@ -475,6 +512,14 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
     if (!isSnakeCase(name) and !isTypeAlias(self, var_decl)) {
         const loc = self.tree.tokenLocation(0, name_token);
         self.report(loc, .Z006, name);
+    }
+
+    // Check that error sets are PascalCase
+    if (var_decl.ast.init_node.unwrap()) |init_node| {
+        if (self.tree.nodeTag(init_node) == .error_set_decl and !isPascalCase(name)) {
+            const loc = self.tree.tokenLocation(0, name_token);
+            self.report(loc, .Z014, name);
+        }
     }
 
     if (var_decl.ast.type_node == .none) {
@@ -683,6 +728,34 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
                 std.mem.eql(u8, token, "@import") or
                 std.mem.eql(u8, token, "@Type");
         },
+        .call_one, .call_one_comma => blk: {
+            // Check if calling a PascalCase function (type constructor)
+            const callee = self.tree.nodeData(init_node).node_and_opt_node[0];
+            const callee_tag = self.tree.nodeTag(callee);
+            if (callee_tag == .identifier) {
+                const fn_name = self.tree.tokenSlice(self.tree.nodeMainToken(callee));
+                break :blk isPascalCase(fn_name);
+            } else if (callee_tag == .field_access) {
+                const data = self.tree.nodeData(callee).node_and_token;
+                const field_name = self.tree.tokenSlice(data[1]);
+                break :blk isPascalCase(field_name);
+            }
+            break :blk false;
+        },
+        .call, .call_comma => blk: {
+            // Check if calling a PascalCase function (type constructor)
+            const callee = self.tree.nodeData(init_node).node_and_extra[0];
+            const callee_tag = self.tree.nodeTag(callee);
+            if (callee_tag == .identifier) {
+                const fn_name = self.tree.tokenSlice(self.tree.nodeMainToken(callee));
+                break :blk isPascalCase(fn_name);
+            } else if (callee_tag == .field_access) {
+                const data = self.tree.nodeData(callee).node_and_token;
+                const field_name = self.tree.tokenSlice(data[1]);
+                break :blk isPascalCase(field_name);
+            }
+            break :blk false;
+        },
         .container_decl,
         .container_decl_trailing,
         .container_decl_two,
@@ -695,6 +768,7 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         .tagged_union_two_trailing,
         .tagged_union_enum_tag,
         .tagged_union_enum_tag_trailing,
+        .error_set_decl,
         => true,
         else => false,
     };
@@ -974,6 +1048,22 @@ test "Z006: allow type alias with union" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z006: allow error set type" {
+    var linter: Linter = .init(std.testing.allocator, "const Oom = error{OutOfMemory};", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z006: allow type function call" {
+    var linter: Linter = .init(std.testing.allocator, "fn GenericType(comptime T: type) type { return struct {}; } const MyType = GenericType(u32);", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z006);
+    }
 }
 
 test "Z006: allow type alias with field access ending in PascalCase" {
@@ -1395,6 +1485,17 @@ test "Z012: pub fn returning error union with private type" {
     try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
 }
 
+test "Z012: pub fn returning private error set" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Oom = error{OutOfMemory};
+        \\pub fn doThing() Oom!void {}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
 test "Z012: pub fn returning public type is ok" {
     var linter: Linter = .init(std.testing.allocator,
         \\pub const Public = struct {};
@@ -1506,5 +1607,22 @@ test "Z013: import used as identifier is ok" {
     linter.lint();
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z013);
+    }
+}
+
+test "Z014: detect snake_case error set" {
+    var linter: Linter = .init(std.testing.allocator, "const my_error = error{OutOfMemory};", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z014, linter.diagnostics.items[0].rule);
+}
+
+test "Z014: allow PascalCase error set" {
+    var linter: Linter = .init(std.testing.allocator, "const Oom = error{OutOfMemory};", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z014);
     }
 }
