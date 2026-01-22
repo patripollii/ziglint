@@ -3,9 +3,9 @@
 const std = @import("std");
 const Linter = @import("Linter.zig");
 const ModuleGraph = @import("ModuleGraph.zig");
+const TypeResolver = @import("TypeResolver.zig");
 
 pub const Config = struct {
-    root_source: ?[]const u8 = null,
     zig_lib_path: ?[]const u8 = null,
     paths: []const []const u8 = &.{},
 };
@@ -24,18 +24,16 @@ pub fn main() !u8 {
         else => return err,
     };
 
-    if (config.root_source) |root| {
-        return runSemanticMode(allocator, root, config.zig_lib_path, &stdout.interface);
-    }
-
     if (config.paths.len == 0) {
         try printUsage(&stdout.interface);
         return 1;
     }
 
+    const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(allocator, &stdout.interface) catch null;
+
     var total_issues: usize = 0;
     for (config.paths) |path| {
-        total_issues += try lintPath(allocator, path, &stdout.interface);
+        total_issues += try lintPath(allocator, path, zig_lib_path, &stdout.interface);
     }
 
     return if (total_issues > 0) 1 else 0;
@@ -50,14 +48,7 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--root")) {
-            i += 1;
-            if (i >= args.len) {
-                try writer.writeAll("error: --root requires a file path argument\n");
-                return error.InvalidArgs;
-            }
-            config.root_source = args[i];
-        } else if (std.mem.eql(u8, arg, "--zig-lib-path")) {
+        if (std.mem.eql(u8, arg, "--zig-lib-path")) {
             i += 1;
             if (i >= args.len) {
                 try writer.writeAll("error: --zig-lib-path requires a path argument\n");
@@ -77,24 +68,6 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
 
     config.paths = paths.items;
     return config;
-}
-
-fn runSemanticMode(
-    allocator: std.mem.Allocator,
-    root_source: []const u8,
-    explicit_lib_path: ?[]const u8,
-    writer: *std.Io.Writer,
-) !u8 {
-    const zig_lib_path = explicit_lib_path orelse try detectZigLibPath(allocator, writer);
-
-    var graph = ModuleGraph.init(allocator, root_source, zig_lib_path) catch |err| {
-        try writer.print("error: could not build module graph: {}\n", .{err});
-        return 1;
-    };
-    defer graph.deinit();
-
-    try writer.print("semantic mode: parsed {} modules from root={s}\n", .{ graph.moduleCount(), root_source });
-    return 0;
 }
 
 fn detectZigLibPath(allocator: std.mem.Allocator, writer: *std.Io.Writer) !?[]const u8 {
@@ -129,20 +102,20 @@ fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]co
     return allocator.dupe(u8, output[value_start..end_idx]) catch null;
 }
 
-fn lintPath(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer) !usize {
+fn lintPath(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, writer: *std.Io.Writer) !usize {
     const stat = std.fs.cwd().statFile(path) catch |err| {
         try writer.print("error: cannot access '{s}': {}\n", .{ path, err });
         return 0;
     };
 
     if (stat.kind == .directory) {
-        return lintDirectory(allocator, path, writer);
+        return lintDirectory(allocator, path, zig_lib_path, writer);
     }
 
-    return lintFile(allocator, path, writer);
+    return lintFile(allocator, path, zig_lib_path, writer);
 }
 
-fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer) !usize {
+fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, writer: *std.Io.Writer) !usize {
     var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
         try writer.print("error: cannot open directory '{s}': {}\n", .{ path, err });
         return 0;
@@ -167,7 +140,7 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io
         const full_path = std.fs.path.join(allocator, &.{ path, entry.path }) catch continue;
         defer allocator.free(full_path);
 
-        total += try lintFile(allocator, full_path, writer);
+        total += try lintFile(allocator, full_path, zig_lib_path, writer);
     }
 
     return total;
@@ -215,7 +188,7 @@ fn loadGitignore(allocator: std.mem.Allocator, dir: std.fs.Dir) ?[]const u8 {
     return dir.readFileAlloc(allocator, ".gitignore", 1024 * 64) catch null;
 }
 
-fn lintFile(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer) !usize {
+fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, writer: *std.Io.Writer) !usize {
     const source = std.fs.cwd().readFileAllocOptions(
         allocator,
         path,
@@ -229,7 +202,31 @@ fn lintFile(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.Writ
     };
     defer allocator.free(source);
 
-    var linter: Linter = .init(allocator, source, path);
+    var graph = ModuleGraph.init(allocator, path, zig_lib_path) catch {
+        var linter: Linter = .init(allocator, source, path);
+        defer linter.deinit();
+        linter.lint();
+        for (linter.diagnostics.items) |diag| {
+            try diag.write(writer);
+        }
+        return linter.diagnostics.items.len;
+    };
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(allocator, &graph);
+    defer resolver.deinit();
+
+    const mod = graph.getModule(path) orelse {
+        var linter: Linter = .init(allocator, source, path);
+        defer linter.deinit();
+        linter.lint();
+        for (linter.diagnostics.items) |diag| {
+            try diag.write(writer);
+        }
+        return linter.diagnostics.items.len;
+    };
+
+    var linter: Linter = .initWithSemantics(allocator, mod.source, mod.path, &resolver, mod.path);
     defer linter.deinit();
 
     linter.lint();
@@ -244,18 +241,15 @@ fn lintFile(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.Writ
 fn printUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage: ziglint [options] <paths...>
-        \\       ziglint --root <file> [options]
         \\
         \\Lint Zig source files for style and correctness issues.
         \\
         \\Options:
-        \\  --root <file>         Enable semantic analysis mode with the given root source file.
-        \\                        This enables cross-file type resolution and additional checks.
         \\  --zig-lib-path <path> Override the path to the Zig standard library.
         \\                        Auto-detected from 'zig env' if not specified.
         \\  -h, --help            Show this help message.
         \\
-        \\When run without --root, directories are scanned recursively for .zig files.
+        \\Directories are scanned recursively for .zig files.
         \\
     );
 }
