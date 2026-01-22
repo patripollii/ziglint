@@ -42,9 +42,10 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Add a ziglint step to your build. Use as a dependency to run linting.
+/// The ziglint executable is always built with ReleaseFast for speed.
 /// Example usage in a downstream project:
 /// ```zig
-/// const ziglint_dep = b.dependency("ziglint", .{});
+/// const ziglint_dep = b.dependency("ziglint", .{ .optimize = .ReleaseFast });
 /// const lint_step = ziglint.addLint(b, ziglint_dep, &.{ "src", "build.zig" });
 /// b.step("lint", "Run ziglint").dependOn(lint_step);
 /// ```
@@ -56,6 +57,7 @@ pub fn addLint(
     const exe = switch (@TypeOf(ziglint_dep)) {
         *std.Build.Step.Compile => ziglint_dep,
         *std.Build.Dependency => ziglint_dep.artifact("ziglint"),
+        *const std.Build.Dependency => ziglint_dep.artifact("ziglint"),
         else => @compileError("expected *Compile or *Dependency"),
     };
 
