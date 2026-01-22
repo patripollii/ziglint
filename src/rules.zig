@@ -9,6 +9,7 @@ pub const Rule = enum(u16) {
     Z006 = 6,
     Z007 = 7,
     Z008 = 8,
+    Z009 = 9,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -24,6 +25,7 @@ pub const Rule = enum(u16) {
             .Z006 => try writer.print("variable '{s}' should be snake_case", .{context}),
             .Z007 => try writer.print("duplicate import '{s}'", .{context}),
             .Z008 => try writer.writeAll("comment divider line"),
+            .Z009 => try writer.print("file '{s}' has top-level fields and should be PascalCase", .{context}),
         }
     }
 };

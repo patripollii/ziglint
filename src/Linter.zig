@@ -54,6 +54,7 @@ pub fn lint(self: *Linter) void {
     if (self.tree.errors.len > 0) return;
 
     self.checkCommentDividers();
+    self.checkFileAsStruct();
 
     for (self.tree.rootDecls()) |node| {
         self.visitNode(node);
@@ -64,6 +65,31 @@ fn checkParseErrors(self: *Linter) void {
     for (self.tree.errors) |err| {
         const loc = self.tree.tokenLocation(0, err.token);
         self.report(loc, .Z003, "");
+    }
+}
+
+fn checkFileAsStruct(self: *Linter) void {
+    // Check if file has top-level fields (container fields at root level)
+    var has_top_level_fields = false;
+    for (self.tree.rootDecls()) |node| {
+        const tag = self.tree.nodeTag(node);
+        if (tag == .container_field_init or tag == .container_field) {
+            has_top_level_fields = true;
+            break;
+        }
+    }
+
+    if (!has_top_level_fields) return;
+
+    // File has top-level fields, check if filename is PascalCase
+    const basename = std.fs.path.basename(self.path);
+    const name = if (std.mem.endsWith(u8, basename, ".zig"))
+        basename[0 .. basename.len - 4]
+    else
+        basename;
+
+    if (!isPascalCase(name)) {
+        self.report(.{ .line = 0, .column = 0, .line_start = 0, .line_end = 0 }, .Z009, basename);
     }
 }
 
@@ -746,6 +772,28 @@ test "Z008: detect short separators" {
 
 test "Z008: allow normal comments" {
     var linter: Linter = .init(std.testing.allocator, "// This is a normal comment", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z009: file with top-level fields needs PascalCase name" {
+    var linter: Linter = .init(std.testing.allocator, "foo: u32 = 0,", "my_module.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z009, linter.diagnostics.items[0].rule);
+}
+
+test "Z009: file with top-level fields and PascalCase name is ok" {
+    var linter: Linter = .init(std.testing.allocator, "foo: u32 = 0,", "MyModule.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z009: file without top-level fields can be lowercase" {
+    var linter: Linter = .init(std.testing.allocator, "const x: u32 = 0;", "main.zig");
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
