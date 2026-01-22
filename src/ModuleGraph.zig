@@ -1,10 +1,12 @@
 //! Module graph for semantic analysis.
 //!
 //! Parses @import calls from AST and recursively resolves all reachable modules,
-//! building a graph that maps import paths to parsed ASTs.
+//! building a graph that maps import paths to parsed ASTs and ZIR.
 
 const std = @import("std");
 const Ast = std.zig.Ast;
+const Zir = std.zig.Zir;
+const AstGen = std.zig.AstGen;
 
 const ModuleGraph = @This();
 
@@ -17,6 +19,7 @@ pub const Module = struct {
     path: []const u8,
     source: [:0]const u8,
     tree: Ast,
+    zir: ?Zir = null,
 };
 
 pub fn init(allocator: std.mem.Allocator, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
@@ -36,6 +39,7 @@ pub fn init(allocator: std.mem.Allocator, root_source: []const u8, zig_lib_path:
 pub fn deinit(self: *ModuleGraph) void {
     var iter = self.modules.valueIterator();
     while (iter.next()) |mod| {
+        if (mod.zir) |*zir| zir.deinit(self.allocator);
         mod.tree.deinit(self.allocator);
         self.allocator.free(mod.source);
         self.allocator.free(mod.path);
@@ -70,10 +74,19 @@ fn addModule(self: *ModuleGraph, path: []const u8) !void {
         return;
     };
 
+    const zir: ?Zir = if (tree.errors.len == 0)
+        AstGen.generate(self.allocator, tree) catch |err| blk: {
+            std.log.warn("ZIR generation failed for '{s}': {}", .{ canonical, err });
+            break :blk null;
+        }
+    else
+        null;
+
     try self.modules.put(self.allocator, canonical, .{
         .path = canonical,
         .source = source,
         .tree = tree,
+        .zir = zir,
     });
 
     // Recursively add imported modules
@@ -200,6 +213,15 @@ pub fn getModule(self: *const ModuleGraph, path: []const u8) ?*const Module {
     return self.modules.getPtr(canonical);
 }
 
+pub fn zirCount(self: *const ModuleGraph) usize {
+    var count: usize = 0;
+    var iter = self.modules.valueIterator();
+    while (iter.next()) |mod| {
+        if (mod.zir != null) count += 1;
+    }
+    return count;
+}
+
 test "parse simple module" {
     const source =
         \\const std = @import("std");
@@ -271,4 +293,40 @@ test "no duplicate modules" {
 
     // main.zig, other.zig, shared.zig - no duplicates
     try std.testing.expectEqual(3, graph.moduleCount());
+}
+
+test "generate ZIR for valid modules" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "pub fn main() void {}" });
+
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    try std.testing.expectEqual(1, graph.moduleCount());
+    try std.testing.expectEqual(1, graph.zirCount());
+
+    const mod = graph.getModule(path);
+    try std.testing.expect(mod != null);
+    try std.testing.expect(mod.?.zir != null);
+}
+
+test "skip ZIR for modules with parse errors" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "fn broken( {}" });
+
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    try std.testing.expectEqual(1, graph.moduleCount());
+    try std.testing.expectEqual(0, graph.zirCount());
 }
