@@ -23,6 +23,8 @@ import_bindings: std.StringHashMapUnmanaged(ImportInfo) = .empty,
 used_identifiers: std.StringHashMapUnmanaged(void) = .empty,
 current_fn_return_type: Ast.Node.OptionalIndex = .none,
 local_vars: std.StringHashMapUnmanaged(void) = .empty,
+fn_params: std.StringHashMapUnmanaged(void) = .empty,
+param_derived_locals: std.StringHashMapUnmanaged(void) = .empty,
 in_function_body: bool = false,
 
 const ImportInfo = struct {
@@ -117,6 +119,8 @@ pub fn deinit(self: *Linter) void {
     self.import_bindings.deinit(self.allocator);
     self.used_identifiers.deinit(self.allocator);
     self.local_vars.deinit(self.allocator);
+    self.fn_params.deinit(self.allocator);
+    self.param_derived_locals.deinit(self.allocator);
 }
 
 pub fn lint(self: *Linter) void {
@@ -510,9 +514,19 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
             const prev_in_function_body = self.in_function_body;
             if (fn_proto) |proto| {
                 self.current_fn_return_type = proto.ast.return_type;
+                // Track function parameters
+                self.fn_params.clearRetainingCapacity();
+                var it = proto.iterate(&self.tree);
+                while (it.next()) |param| {
+                    if (param.name_token) |name_tok| {
+                        const param_name = self.tree.tokenSlice(name_tok);
+                        self.fn_params.put(self.allocator, param_name, {}) catch {};
+                    }
+                }
             }
             // Clear local vars and mark that we're in a function body
             self.local_vars.clearRetainingCapacity();
+            self.param_derived_locals.clearRetainingCapacity();
             self.in_function_body = true;
             self.visitNode(data[0]);
             self.visitNode(data[1]);
@@ -1225,6 +1239,31 @@ fn trackLocalVar(self: *Linter, node: Ast.Node.Index) void {
     const name_token = var_decl.ast.mut_token + 1;
     const name = self.tree.tokenSlice(name_token);
     self.local_vars.put(self.allocator, name, {}) catch {};
+
+    // Check if this local is derived from a parameter (slice or direct assignment)
+    const init_node = var_decl.ast.init_node.unwrap() orelse return;
+    if (self.isDerivedFromParam(init_node)) {
+        self.param_derived_locals.put(self.allocator, name, {}) catch {};
+    }
+}
+
+fn isDerivedFromParam(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+    switch (tag) {
+        .identifier => {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+            return self.fn_params.contains(name) or self.param_derived_locals.contains(name);
+        },
+        .slice_open, .slice, .slice_sentinel => {
+            const slice = self.tree.fullSlice(node) orelse return false;
+            return self.isDerivedFromParam(slice.ast.sliced);
+        },
+        .array_access => {
+            const data = self.tree.nodeData(node).node_and_node;
+            return self.isDerivedFromParam(data[0]);
+        },
+        else => return false,
+    }
 }
 
 fn checkReturnedStackReference(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.Node.Index) void {
@@ -1235,7 +1274,7 @@ fn checkReturnedStackReference(self: *Linter, return_node: Ast.Node.Index, retur
         const operand = self.tree.nodeData(return_expr).node;
         if (self.tree.nodeTag(operand) == .identifier) {
             const name = self.tree.tokenSlice(self.tree.nodeMainToken(operand));
-            if (self.local_vars.contains(name)) {
+            if (self.isStackLocal(name)) {
                 const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
                 self.report(loc, .Z019, name);
             }
@@ -1247,12 +1286,18 @@ fn checkReturnedStackReference(self: *Linter, return_node: Ast.Node.Index, retur
         const slice = self.tree.fullSlice(return_expr) orelse return;
         if (self.tree.nodeTag(slice.ast.sliced) == .identifier) {
             const name = self.tree.tokenSlice(self.tree.nodeMainToken(slice.ast.sliced));
-            if (self.local_vars.contains(name)) {
+            if (self.isStackLocal(name)) {
                 const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
                 self.report(loc, .Z019, name);
             }
         }
     }
+}
+
+fn isStackLocal(self: *Linter, name: []const u8) bool {
+    return self.local_vars.contains(name) and
+        !self.fn_params.contains(name) and
+        !self.param_derived_locals.contains(name);
 }
 
 fn getAsTypeName(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
