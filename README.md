@@ -34,3 +34,4 @@ Directories are scanned recursively for `.zig` files.
 | Z013 | Unused import |
 | Z014 | Error set names should be PascalCase |
 | Z015 | Public function exposes private error set |
+| Z016 | Split compound assert: `assert(a and b)` → `assert(a); assert(b);` |

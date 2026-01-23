@@ -103,3 +103,12 @@ Inspired by [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/do
 **Comments:**
 - Explain *why* the code exists, not *what* it does
 - Document non-obvious thresholds, timing values, protocol details
+
+## Diagnostic Message Coloring
+
+When syntax-highlighting code in diagnostic messages:
+- Blue: functions (`assert`, `init`)
+- Purple: keywords (`and`, `or`, `const`)
+- Yellow: identifiers, variables
+- Magenta: types
+- Dim: punctuation, backticks

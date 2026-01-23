@@ -16,22 +16,25 @@ pub const Rule = enum(u16) {
     Z013 = 13,
     Z014 = 14,
     Z015 = 15,
+    Z016 = 16,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
     }
 
     // ANSI escape codes
+    const blue = "\x1b[34m";
     const yellow = "\x1b[33m";
     const magenta = "\x1b[35m";
-    const cyan = "\x1b[36m";
+    const purple = "\x1b[35m";
     const dim = "\x1b[2m";
     const reset = "\x1b[0m";
 
     pub fn writeMessage(self: Rule, writer: *std.Io.Writer, context: []const u8, use_color: bool) !void {
+        const b = if (use_color) blue else "";
         const y = if (use_color) yellow else "";
         const m = if (use_color) magenta else "";
-        const c = if (use_color) cyan else "";
+        const p = if (use_color) purple else "";
         const d = if (use_color) dim else "";
         const r = if (use_color) reset else "";
 
@@ -40,7 +43,8 @@ pub const Rule = enum(u16) {
             .Z002 => try writer.print("variable {s}'{s}'{s} is unused but has a value", .{ y, context, r }),
             .Z003 => try writer.writeAll("parse error"),
             // syntax highlight: `const name: T = .{};` vs `const name = T{};`
-            .Z004 => try writer.print("prefer {s}`{s}{s}const{s} {s}{s}:{s} {s}T{s} = .{{}}{s};{s}{s}`{s} over {s}`{s}{s}const{s} {s} = {s}T{s}{{}}{s};{s}{s}`{s}", .{ d, r, m, r, context, d, r, c, r, d, r, d, r, d, r, m, r, context, c, r, d, r, d, r }),
+            // const=purple (keyword), name=yellow (identifier), T=magenta (type)
+            .Z004 => try writer.print("prefer {s}`{s}{s}const{s} {s}{s}:{s} {s}T{s} = .{{}}{s};{s}{s}`{s} over {s}`{s}{s}const{s} {s} = {s}T{s}{{}}{s};{s}{s}`{s}", .{ d, r, p, r, context, d, r, m, r, d, r, d, r, d, r, p, r, context, m, r, d, r, d, r }),
             .Z005 => try writer.print("type function {s}'{s}'{s} should be PascalCase", .{ y, context, r }),
             .Z006 => try writer.print("variable {s}'{s}'{s} should be snake_case", .{ y, context, r }),
             .Z007 => try writer.print("duplicate import {s}'{s}'{s}", .{ y, context, r }),
@@ -53,9 +57,9 @@ pub const Rule = enum(u16) {
                 const preferred = context[0..sep];
                 const original = if (sep < context.len) context[sep + 1 ..] else context;
                 try writer.print("prefer {s}`{s}", .{ d, r });
-                try writeHighlightedStructInit(writer, preferred, c, d, r);
+                try writeHighlightedStructInit(writer, preferred, m, d, r);
                 try writer.print("{s}`{s} over {s}`{s}", .{ d, r, d, r });
-                try writeHighlightedStructInit(writer, original, c, d, r);
+                try writeHighlightedStructInit(writer, original, m, d, r);
                 try writer.print("{s}`{s}", .{ d, r });
             },
             .Z011 => try writer.print("{s}", .{context}),
@@ -63,13 +67,23 @@ pub const Rule = enum(u16) {
             .Z013 => try writer.print("unused import {s}'{s}'{s}", .{ y, context, r }),
             .Z014 => try writer.print("error set {s}'{s}'{s} should be PascalCase", .{ y, context, r }),
             .Z015 => try writer.print("public function exposes private error set {s}'{s}'{s}", .{ y, context, r }),
+            .Z016 => {
+                // assert=blue, and/or=purple, a/b=yellow, punctuation=dim
+                // `assert(a and b)` -> `assert(a); assert(b);`
+                try writer.print("split compound assert: {s}`{s}{s}assert{s}{s}({s}{s}a{s} {s}{s}{s} {s}b{s}{s})`{s}", .{
+                    d, r, b, r, d, r, y, r, p, context, r, y, r, d, r,
+                });
+                try writer.print(" -> {s}`{s}{s}assert{s}{s}({s}{s}a{s}{s}); {s}{s}assert{s}{s}({s}{s}b{s}{s});`{s}", .{
+                    d, r, b, r, d, r, y, r, d, r, b, r, d, r, y, r, d, r,
+                });
+            },
         }
     }
 };
 
 const std = @import("std");
 
-fn writeHighlightedStructInit(writer: *std.Io.Writer, code: []const u8, cyan: []const u8, dim: []const u8, reset: []const u8) !void {
+fn writeHighlightedStructInit(writer: *std.Io.Writer, code: []const u8, type_color: []const u8, dim: []const u8, reset: []const u8) !void {
     const yellow = "\x1b[33m";
     // Handle truncated case: "Type{" -> "Type{...}"
     const is_truncated = std.mem.endsWith(u8, code, "{");
@@ -112,8 +126,8 @@ fn writeHighlightedStructInit(writer: *std.Io.Writer, code: []const u8, cyan: []
             while (i < code.len and code[i] != '{' and code[i] != '}' and code[i] != '.' and code[i] != ',' and code[i] != '=' and code[i] != ' ') : (i += 1) {}
             const token = code[start..i];
             if (!in_braces) {
-                // Type name before { - cyan
-                try writer.print("{s}{s}{s}", .{ cyan, token, reset });
+                // Type name before { - magenta
+                try writer.print("{s}{s}{s}", .{ type_color, token, reset });
             } else if (after_dot) {
                 // Field name after . - yellow
                 try writer.print("{s}{s}{s}", .{ yellow, token, reset });

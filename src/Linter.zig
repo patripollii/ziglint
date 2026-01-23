@@ -522,6 +522,7 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
         .call_one, .call_one_comma, .call, .call_comma => {
             self.checkCallArgs(node);
             self.checkDeprecatedCall(node);
+            self.checkCompoundAssert(node);
         },
         else => {},
     }
@@ -717,6 +718,34 @@ fn containsDeprecated(text: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(slice, "deprecated")) return true;
     }
     return false;
+}
+
+fn checkCompoundAssert(self: *Linter, node: Ast.Node.Index) void {
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = self.tree.fullCall(&buf, node) orelse return;
+
+    // Check if this is a call to "assert"
+    const fn_expr = call.ast.fn_expr;
+    const is_assert = switch (self.tree.nodeTag(fn_expr)) {
+        .identifier => std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(fn_expr)), "assert"),
+        .field_access => blk: {
+            const data = self.tree.nodeData(fn_expr).node_and_token;
+            break :blk std.mem.eql(u8, self.tree.tokenSlice(data[1]), "assert");
+        },
+        else => false,
+    };
+    if (!is_assert) return;
+
+    // Check if argument is a compound bool_and or bool_or
+    if (call.ast.params.len == 0) return;
+    const arg = call.ast.params[0];
+    const arg_tag = self.tree.nodeTag(arg);
+
+    // Only flag `and` - `assert(a or b)` is not equivalent to `assert(a); assert(b);`
+    if (arg_tag != .bool_and) return;
+
+    const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(node));
+    self.report(loc, .Z016, "and");
 }
 
 fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool) void {
@@ -1838,5 +1867,52 @@ test "Z014: allow PascalCase error set" {
     linter.lint();
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z014);
+    }
+}
+
+test "Z016: detect compound assert with and" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    std.debug.assert(a and b);
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z016) {
+            found = true;
+            try std.testing.expectEqualStrings("and", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z016: assert with or is ok (different semantics)" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const assert = @import("std").debug.assert;
+        \\fn foo() void {
+        \\    assert(x or y);
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z016);
+    }
+}
+
+test "Z016: simple assert is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    std.debug.assert(a);
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z016);
     }
 }
