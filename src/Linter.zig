@@ -1538,6 +1538,7 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         .tagged_union_enum_tag,
         .tagged_union_enum_tag_trailing,
         .error_set_decl,
+        .merge_error_sets,
         => true,
         else => false,
     };
