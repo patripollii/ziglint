@@ -26,7 +26,6 @@ Directories are scanned recursively for `.zig` files.
 | Z005 | Type function names should be PascalCase |
 | Z006 | Variable names should be snake_case |
 | Z007 | Duplicate import |
-| Z008 | Comment divider line |
 | Z009 | Files with top-level fields should be PascalCase |
 | Z010 | Redundant type specifier; prefer `.value` over explicit type |
 | Z011 | Deprecated method call |

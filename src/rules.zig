@@ -8,7 +8,6 @@ pub const Rule = enum(u16) {
     Z005 = 5,
     Z006 = 6,
     Z007 = 7,
-    Z008 = 8,
     Z009 = 9,
     Z010 = 10,
     Z011 = 11,
@@ -54,7 +53,6 @@ pub const Rule = enum(u16) {
             .Z005 => try writer.print("type function {s}'{s}'{s} should be PascalCase", .{ y, context, r }),
             .Z006 => try writer.print("variable {s}'{s}'{s} should be snake_case", .{ y, context, r }),
             .Z007 => try writer.print("duplicate import {s}'{s}'{s}", .{ y, context, r }),
-            .Z008 => try writer.writeAll("comment divider line"),
             .Z009 => try writer.print("file {s}'{s}'{s} has top-level fields and should be PascalCase", .{ y, context, r }),
             // syntax highlight: .{...} over Type{...}
             // context is "preferred\x00original" format

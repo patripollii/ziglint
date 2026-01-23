@@ -123,7 +123,6 @@ pub fn lint(self: *Linter) void {
     self.checkParseErrors();
     if (self.tree.errors.len > 0) return;
 
-    self.checkCommentDividers();
     self.checkFileAsStruct();
     self.buildPublicTypesMap();
     self.collectAllIdentifiers();
@@ -217,49 +216,6 @@ fn checkFileAsStruct(self: *Linter) void {
     if (!isPascalCase(name)) {
         self.report(.{ .line = 0, .column = 0, .line_start = 0, .line_end = 0 }, .Z009, basename);
     }
-}
-
-fn checkCommentDividers(self: *Linter) void {
-    var line_num: usize = 0;
-    var line_start: usize = 0;
-
-    for (self.source, 0..) |c, i| {
-        if (c == '\n') {
-            const line = self.source[line_start..i];
-            if (isDividerComment(line)) {
-                self.report(.{ .line = line_num, .column = 0, .line_start = line_start, .line_end = i }, .Z008, "");
-            }
-            line_num += 1;
-            line_start = i + 1;
-        }
-    }
-
-    // Check last line if no trailing newline
-    if (line_start < self.source.len) {
-        const line = self.source[line_start..];
-        if (isDividerComment(line)) {
-            self.report(.{ .line = line_num, .column = 0, .line_start = line_start, .line_end = self.source.len }, .Z008, "");
-        }
-    }
-}
-
-fn isDividerComment(line: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, line, " \t");
-    if (!std.mem.startsWith(u8, trimmed, "//")) return false;
-
-    const after_slashes = std.mem.trimLeft(u8, trimmed[2..], " ");
-    if (after_slashes.len < 3) return false;
-
-    // Check if mostly one repeated character
-    const first = after_slashes[0];
-    if (first != '=' and first != '-' and first != '*' and first != '#') return false;
-
-    var count: usize = 0;
-    for (after_slashes) |ch| {
-        if (ch == first) count += 1;
-    }
-
-    return count * 100 / after_slashes.len >= 80;
 }
 
 fn buildPublicTypesMap(self: *Linter) void {
@@ -2033,37 +1989,6 @@ test "Z007: multiple duplicates" {
         if (d.rule == rules.Rule.Z007) z007_count += 1;
     }
     try std.testing.expectEqual(2, z007_count);
-}
-
-test "Z008: detect comment divider with equals" {
-    var linter: Linter = .init(std.testing.allocator, "// ========================================", "test.zig");
-    defer linter.deinit();
-    linter.lint();
-    try std.testing.expectEqual(1, linter.diagnostics.items.len);
-    try std.testing.expectEqual(rules.Rule.Z008, linter.diagnostics.items[0].rule);
-}
-
-test "Z008: detect comment divider with dashes" {
-    var linter: Linter = .init(std.testing.allocator, "// ----------------------------------------", "test.zig");
-    defer linter.deinit();
-    linter.lint();
-    try std.testing.expectEqual(1, linter.diagnostics.items.len);
-    try std.testing.expectEqual(rules.Rule.Z008, linter.diagnostics.items[0].rule);
-}
-
-test "Z008: detect short separators" {
-    var linter: Linter = .init(std.testing.allocator, "// ----", "test.zig");
-    defer linter.deinit();
-    linter.lint();
-    try std.testing.expectEqual(1, linter.diagnostics.items.len);
-    try std.testing.expectEqual(rules.Rule.Z008, linter.diagnostics.items[0].rule);
-}
-
-test "Z008: allow normal comments" {
-    var linter: Linter = .init(std.testing.allocator, "// This is a normal comment", "test.zig");
-    defer linter.deinit();
-    linter.lint();
-    try std.testing.expectEqual(0, linter.diagnostics.items.len);
 }
 
 test "Z009: file with top-level fields needs PascalCase name" {
