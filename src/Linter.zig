@@ -664,6 +664,18 @@ fn checkBlockForUseAfterDeinit(self: *Linter, block_node: Ast.Node.Index) void {
             continue;
         }
 
+        // Check if this is a reassignment to a deinitialized variable
+        // If so, remove it from deinitialized set (it's been reinitialized)
+        if (self.tree.nodeTag(stmt) == .assign) {
+            const data = self.tree.nodeData(stmt).node_and_node;
+            const lhs = data[0];
+            if (self.getRootVarName(lhs)) |var_name| {
+                if (deinitialized.contains(var_name)) {
+                    _ = deinitialized.remove(var_name);
+                }
+            }
+        }
+
         // Check if this statement uses any deinitialized variable
         self.checkNodeForDeinitedUse(stmt, &deinitialized);
     }
