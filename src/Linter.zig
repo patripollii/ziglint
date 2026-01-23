@@ -134,6 +134,7 @@ pub fn lint(self: *Linter) void {
 
     self.checkUnusedImports();
     self.checkAllUnsafeOptionalUnwraps();
+    self.checkAllUseAfterDeinit();
 }
 
 fn collectAllIdentifiers(self: *Linter) void {
@@ -632,6 +633,221 @@ fn checkAllUnsafeOptionalUnwraps(self: *Linter) void {
             if (self.isInTestBlock(node)) continue;
             self.checkSingleUnsafeUnwrap(node);
         }
+    }
+}
+
+fn checkAllUseAfterDeinit(self: *Linter) void {
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const tag = self.tree.nodeTag(node);
+        // Find block nodes to scan for sequential deinit then use
+        if (tag == .block or tag == .block_semicolon or
+            tag == .block_two or tag == .block_two_semicolon)
+        {
+            self.checkBlockForUseAfterDeinit(node);
+        }
+    }
+}
+
+fn checkBlockForUseAfterDeinit(self: *Linter, block_node: Ast.Node.Index) void {
+    var buf: [2]Ast.Node.Index = undefined;
+    const stmts = self.getBlockStatements(&buf, block_node) orelse return;
+
+    // Track which variables have been deinitialized (by their token position for uniqueness)
+    var deinitialized: std.StringHashMapUnmanaged(Ast.TokenIndex) = .empty;
+    defer deinitialized.deinit(self.allocator);
+
+    for (stmts) |stmt| {
+        // Check if this statement is a deinit call
+        if (self.extractDeinitCall(stmt)) |info| {
+            deinitialized.put(self.allocator, info.var_name, info.call_token) catch {};
+            continue;
+        }
+
+        // Check if this statement uses any deinitialized variable
+        self.checkNodeForDeinitedUse(stmt, &deinitialized);
+    }
+}
+
+fn getBlockStatements(self: *Linter, buf: *[2]Ast.Node.Index, node: Ast.Node.Index) ?[]const Ast.Node.Index {
+    const tag = self.tree.nodeTag(node);
+    switch (tag) {
+        .block, .block_semicolon => return self.tree.blockStatements(buf, node),
+        .block_two, .block_two_semicolon => {
+            const data = self.tree.nodeData(node).opt_node_and_opt_node;
+            var count: usize = 0;
+            if (data[0].unwrap()) |n| {
+                buf[count] = n;
+                count += 1;
+            }
+            if (data[1].unwrap()) |n| {
+                buf[count] = n;
+                count += 1;
+            }
+            return buf[0..count];
+        },
+        else => return null,
+    }
+}
+
+const DeinitInfo = struct {
+    var_name: []const u8,
+    call_token: Ast.TokenIndex,
+};
+
+fn extractDeinitCall(self: *Linter, node: Ast.Node.Index) ?DeinitInfo {
+    const tag = self.tree.nodeTag(node);
+
+    // Handle: foo.deinit() as a statement
+    if (tag == .call_one or tag == .call_one_comma or tag == .call or tag == .call_comma) {
+        var call_buf: [1]Ast.Node.Index = undefined;
+        const call = self.tree.fullCall(&call_buf, node) orelse return null;
+        return self.extractDeinitFromCall(call, node);
+    }
+
+    // Handle: _ = foo.deinit() (discarded result via assignment)
+    if (tag == .assign) {
+        const data = self.tree.nodeData(node).node_and_node;
+        const lhs = data[0];
+        const rhs = data[1];
+
+        // Check if LHS is underscore
+        if (self.tree.nodeTag(lhs) != .identifier) return null;
+        const lhs_name = self.tree.tokenSlice(self.tree.nodeMainToken(lhs));
+        if (!std.mem.eql(u8, lhs_name, "_")) return null;
+
+        // Check if RHS is a deinit call
+        const rhs_tag = self.tree.nodeTag(rhs);
+        if (rhs_tag == .call_one or rhs_tag == .call_one_comma or rhs_tag == .call or rhs_tag == .call_comma) {
+            var call_buf: [1]Ast.Node.Index = undefined;
+            const call = self.tree.fullCall(&call_buf, rhs) orelse return null;
+            return self.extractDeinitFromCall(call, rhs);
+        }
+    }
+
+    return null;
+}
+
+fn extractDeinitFromCall(self: *Linter, call: Ast.full.Call, call_node: Ast.Node.Index) ?DeinitInfo {
+    // Check if callee is a field_access like foo.deinit
+    const callee = call.ast.fn_expr;
+    if (self.tree.nodeTag(callee) != .field_access) return null;
+
+    const data = self.tree.nodeData(callee).node_and_token;
+    const lhs = data[0];
+    const method_token = data[1];
+    const method_name = self.tree.tokenSlice(method_token);
+
+    // Check for deinit-like method names
+    if (!isDeinitMethod(method_name)) return null;
+
+    // Get the variable being deinitialized (could be simple identifier or field access)
+    const var_name = self.getRootVarName(lhs) orelse return null;
+
+    return .{
+        .var_name = var_name,
+        .call_token = self.tree.nodeMainToken(call_node),
+    };
+}
+
+fn isDeinitMethod(name: []const u8) bool {
+    return std.mem.eql(u8, name, "deinit") or
+        std.mem.eql(u8, name, "free") or
+        std.mem.eql(u8, name, "destroy") or
+        std.mem.eql(u8, name, "close") or
+        std.mem.eql(u8, name, "release");
+}
+
+fn getRootVarName(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
+    const tag = self.tree.nodeTag(node);
+    switch (tag) {
+        .identifier => return self.tree.tokenSlice(self.tree.nodeMainToken(node)),
+        .field_access => {
+            // For foo.bar.baz, walk to get foo
+            const data = self.tree.nodeData(node).node_and_token;
+            return self.getRootVarName(data[0]);
+        },
+        else => return null,
+    }
+}
+
+fn checkNodeForDeinitedUse(self: *Linter, node: Ast.Node.Index, deinitialized: *std.StringHashMapUnmanaged(Ast.TokenIndex)) void {
+    const tag = self.tree.nodeTag(node);
+
+    // Skip deinit calls themselves - they're the cleanup, not a use
+    if (tag == .call_one or tag == .call_one_comma or tag == .call or tag == .call_comma) {
+        if (self.extractDeinitCall(node) != null) return;
+    }
+
+    // Check if this is an identifier that was deinitialized
+    if (tag == .identifier) {
+        const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+        if (deinitialized.contains(name)) {
+            const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(node));
+            self.report(loc, .Z022, name);
+        }
+        return;
+    }
+
+    // For field access, check the root variable
+    if (tag == .field_access) {
+        const root_name = self.getRootVarName(node) orelse return;
+        if (deinitialized.contains(root_name)) {
+            const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(node));
+            self.report(loc, .Z022, root_name);
+        }
+        return;
+    }
+
+    // Recursively check child nodes
+    self.checkChildrenForDeinitedUse(node, deinitialized);
+}
+
+fn checkChildrenForDeinitedUse(self: *Linter, node: Ast.Node.Index, deinitialized: *std.StringHashMapUnmanaged(Ast.TokenIndex)) void {
+    const tag = self.tree.nodeTag(node);
+    switch (tag) {
+        .call_one, .call_one_comma => {
+            const data = self.tree.nodeData(node).node_and_opt_node;
+            self.checkNodeForDeinitedUse(data[0], deinitialized);
+            if (data[1].unwrap()) |arg| self.checkNodeForDeinitedUse(arg, deinitialized);
+        },
+        .call, .call_comma => {
+            var call_buf: [1]Ast.Node.Index = undefined;
+            const call = self.tree.fullCall(&call_buf, node) orelse return;
+            self.checkNodeForDeinitedUse(call.ast.fn_expr, deinitialized);
+            for (call.ast.params) |param| {
+                self.checkNodeForDeinitedUse(param, deinitialized);
+            }
+        },
+        .field_access => {
+            const data = self.tree.nodeData(node).node_and_token;
+            self.checkNodeForDeinitedUse(data[0], deinitialized);
+        },
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+            const var_decl = self.tree.fullVarDecl(node) orelse return;
+            if (var_decl.ast.init_node.unwrap()) |init_node| {
+                self.checkNodeForDeinitedUse(init_node, deinitialized);
+            }
+        },
+        .assign => {
+            const data = self.tree.nodeData(node).node_and_node;
+            self.checkNodeForDeinitedUse(data[0], deinitialized);
+            self.checkNodeForDeinitedUse(data[1], deinitialized);
+        },
+        .@"return" => {
+            if (self.tree.nodeData(node).opt_node.unwrap()) |expr| {
+                self.checkNodeForDeinitedUse(expr, deinitialized);
+            }
+        },
+        .@"if", .if_simple => {
+            const if_full = self.tree.fullIf(node) orelse return;
+            self.checkNodeForDeinitedUse(if_full.ast.cond_expr, deinitialized);
+            self.checkNodeForDeinitedUse(if_full.ast.then_expr, deinitialized);
+            if (if_full.ast.else_expr.unwrap()) |else_expr| {
+                self.checkNodeForDeinitedUse(else_expr, deinitialized);
+            }
+        },
+        else => {},
     }
 }
 
