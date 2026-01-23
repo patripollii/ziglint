@@ -604,7 +604,7 @@ fn resolveFieldAccess(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
             const lhs_tag = tree.nodeTag(lhs_node);
             if (lhs_tag == .identifier) {
                 const lhs_name = tree.tokenSlice(tree.nodeMainToken(lhs_node));
-                if (std.mem.eql(u8, lhs_name, "std")) {
+                if (std.mem.eql(u8, lhs_name, "std") or self.isStdImportAlias(tree, lhs_name)) {
                     return .{ .std_type = .{ .path = field_name } };
                 }
             }
@@ -618,7 +618,6 @@ fn resolveFieldAccess(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
 /// Builds the full path for a std type by walking up the field access chain.
 /// For `std.fs.File`, returns "fs.File".
 fn buildStdTypePath(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index) []const u8 {
-    _ = self;
     var parts: [16][]const u8 = undefined;
     var count: usize = 0;
 
@@ -636,11 +635,11 @@ fn buildStdTypePath(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index)
 
     if (count == 0) return "";
 
-    // Check if root is "std"
+    // Check if root resolves to std (either named "std" or aliased from @import("std"))
     const root_tag = tree.nodeTag(current);
     if (root_tag == .identifier) {
         const root_name = tree.tokenSlice(tree.nodeMainToken(current));
-        if (!std.mem.eql(u8, root_name, "std")) {
+        if (!std.mem.eql(u8, root_name, "std") and !self.isStdImportAlias(tree, root_name)) {
             return "";
         }
     }
@@ -658,21 +657,21 @@ fn buildStdTypePath(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index)
         const last_data = tree.nodeData(node).node_and_token;
         _ = last_data;
 
-        // Find the start of the path after "std."
+        // Find the start of the path after the std alias
         var start_node = node;
         while (tree.nodeTag(start_node) == .field_access) {
             const d = tree.nodeData(start_node).node_and_token;
             const lhs = d[0];
             if (tree.nodeTag(lhs) == .identifier) {
                 const lhs_name = tree.tokenSlice(tree.nodeMainToken(lhs));
-                if (std.mem.eql(u8, lhs_name, "std")) {
+                if (std.mem.eql(u8, lhs_name, "std") or self.isStdImportAlias(tree, lhs_name)) {
                     break;
                 }
             }
             start_node = lhs;
         }
 
-        // Get the token after "std."
+        // Get the token after the std alias
         if (tree.nodeTag(start_node) == .field_access) {
             const start_data = tree.nodeData(start_node).node_and_token;
             const start_field_token = start_data[1];
@@ -695,6 +694,43 @@ fn buildStdTypePath(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index)
     }
 
     return parts[0];
+}
+
+/// Checks if an identifier is bound to @import("std").
+fn isStdImportAlias(self: *TypeResolver, tree: *const Ast, name: []const u8) bool {
+    _ = self;
+    for (tree.rootDecls()) |decl_node| {
+        const decl_tag = tree.nodeTag(decl_node);
+        switch (decl_tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = tree.fullVarDecl(decl_node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                const decl_name = tree.tokenSlice(name_token);
+                if (!std.mem.eql(u8, decl_name, name)) continue;
+
+                const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+                const init_tag = tree.nodeTag(init_node);
+
+                if (init_tag == .builtin_call_two or init_tag == .builtin_call_two_comma) {
+                    const main_token = tree.nodeMainToken(init_node);
+                    const builtin_name = tree.tokenSlice(main_token);
+                    if (std.mem.eql(u8, builtin_name, "@import")) {
+                        var buf: [2]Ast.Node.Index = undefined;
+                        const params = tree.builtinCallParams(&buf, init_node) orelse continue;
+                        if (params.len == 0) continue;
+
+                        const arg_token = tree.nodeMainToken(params[0]);
+                        const raw_path = tree.tokenSlice(arg_token);
+                        if (raw_path.len >= 5 and std.mem.eql(u8, raw_path, "\"std\"")) {
+                            return true;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn resolveBuiltinCall(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) TypeInfo {
@@ -964,6 +1000,66 @@ test "resolve nested field access std.fs.File" {
     const source =
         \\const std = @import("std");
         \\const File = std.fs.File;
+    ;
+
+    var tree = try Ast.parse(std.testing.allocator, source, .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = tree.rootDecls();
+    try std.testing.expect(root_decls.len >= 2);
+
+    const type_info = resolver.typeOf(path, root_decls[1]);
+    try std.testing.expect(type_info == .std_type);
+    try std.testing.expectEqualStrings("fs.File", type_info.std_type.path);
+}
+
+test "resolve field access on aliased std import" {
+    const source =
+        \\const stdlib = @import("std");
+        \\const fs = stdlib.fs;
+    ;
+
+    var tree = try Ast.parse(std.testing.allocator, source, .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = tree.rootDecls();
+    try std.testing.expect(root_decls.len >= 2);
+
+    const type_info = resolver.typeOf(path, root_decls[1]);
+    try std.testing.expect(type_info == .std_type);
+    try std.testing.expectEqualStrings("fs", type_info.std_type.path);
+}
+
+test "resolve nested field access on aliased std import" {
+    const source =
+        \\const stdlib = @import("std");
+        \\const File = stdlib.fs.File;
     ;
 
     var tree = try Ast.parse(std.testing.allocator, source, .zig);
