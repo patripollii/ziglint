@@ -21,7 +21,6 @@ pub const Rule = enum(u16) {
     Z019 = 19,
     Z020 = 20,
     Z021 = 21,
-    Z022 = 22,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -113,11 +112,6 @@ pub const Rule = enum(u16) {
             .Z021 => {
                 try writer.print("optional unwrap {s}.?{s} on {s}'{s}'{s} without prior null check", .{
                     d, r, y, context, r,
-                });
-            },
-            .Z022 => {
-                try writer.print("use of {s}'{s}'{s} after {s}deinit{s}{s}(){s}", .{
-                    y, context, r, b, r, d, r,
                 });
             },
         }
