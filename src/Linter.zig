@@ -639,9 +639,9 @@ fn checkBlockForUseAfterDeinit(self: *Linter, block_node: Ast.Node.Index) void {
         if (self.tree.nodeTag(stmt) == .assign) {
             const data = self.tree.nodeData(stmt).node_and_node;
             const lhs = data[0];
-            if (self.getRootVarName(lhs)) |var_name| {
-                if (deinitialized.contains(var_name)) {
-                    _ = deinitialized.remove(var_name);
+            if (self.getFullVarPath(lhs)) |var_path| {
+                if (deinitialized.contains(var_path)) {
+                    _ = deinitialized.remove(var_path);
                 }
             }
         }
@@ -723,8 +723,8 @@ fn extractDeinitFromCall(self: *Linter, call: Ast.full.Call, call_node: Ast.Node
     // Check for deinit-like method names
     if (!isDeinitMethod(method_name)) return null;
 
-    // Get the variable being deinitialized (could be simple identifier or field access)
-    const var_name = self.getRootVarName(lhs) orelse return null;
+    // Get the full path of what's being deinitialized (e.g., "self.images" not just "self")
+    const var_name = self.getFullVarPath(lhs) orelse return null;
 
     return .{
         .var_name = var_name,
@@ -753,6 +753,18 @@ fn getRootVarName(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
     }
 }
 
+fn getFullVarPath(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
+    const tag = self.tree.nodeTag(node);
+    switch (tag) {
+        .identifier => return self.tree.tokenSlice(self.tree.nodeMainToken(node)),
+        .field_access => {
+            // For foo.bar.baz, return the full source text "foo.bar.baz"
+            return self.getNodeSource(node);
+        },
+        else => return null,
+    }
+}
+
 fn checkNodeForDeinitedUse(self: *Linter, node: Ast.Node.Index, deinitialized: *std.StringHashMapUnmanaged(Ast.TokenIndex)) void {
     const tag = self.tree.nodeTag(node);
 
@@ -771,18 +783,37 @@ fn checkNodeForDeinitedUse(self: *Linter, node: Ast.Node.Index, deinitialized: *
         return;
     }
 
-    // For field access, check the root variable
+    // For field access, check if this path or any prefix was deinitialized
     if (tag == .field_access) {
-        const root_name = self.getRootVarName(node) orelse return;
-        if (deinitialized.contains(root_name)) {
+        const full_path = self.getFullVarPath(node) orelse return;
+        if (self.isDeinitedPath(full_path, deinitialized)) |deinited_name| {
             const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(node));
-            self.report(loc, .Z022, root_name);
+            self.report(loc, .Z022, deinited_name);
         }
         return;
     }
 
     // Recursively check child nodes
     self.checkChildrenForDeinitedUse(node, deinitialized);
+}
+
+fn isDeinitedPath(self: *Linter, path: []const u8, deinitialized: *std.StringHashMapUnmanaged(Ast.TokenIndex)) ?[]const u8 {
+    _ = self;
+    // Check exact match first
+    if (deinitialized.contains(path)) return path;
+
+    // Check if any prefix of the path was deinitialized
+    // e.g., if "self.images" was deinitialized, "self.images.foo" is also invalid
+    var it = deinitialized.keyIterator();
+    while (it.next()) |key| {
+        if (std.mem.startsWith(u8, path, key.*)) {
+            // Make sure it's a proper prefix (followed by '.' or end of string)
+            if (path.len == key.len or path[key.len] == '.') {
+                return key.*;
+            }
+        }
+    }
+    return null;
 }
 
 fn checkChildrenForDeinitedUse(self: *Linter, node: Ast.Node.Index, deinitialized: *std.StringHashMapUnmanaged(Ast.TokenIndex)) void {
