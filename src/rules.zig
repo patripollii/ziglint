@@ -21,6 +21,7 @@ pub const Rule = enum(u16) {
     Z018 = 18,
     Z019 = 19,
     Z020 = 20,
+    Z021 = 21,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -108,6 +109,11 @@ pub const Rule = enum(u16) {
             .Z020 => {
                 try writer.print("function {s}'{s}'{s} returns error union but never returns or propagates errors", .{
                     y, context, r,
+                });
+            },
+            .Z021 => {
+                try writer.print("optional unwrap {s}.?{s} on {s}'{s}'{s} without prior null check", .{
+                    d, r, y, context, r,
                 });
             },
         }

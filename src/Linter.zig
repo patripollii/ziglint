@@ -133,6 +133,7 @@ pub fn lint(self: *Linter) void {
     }
 
     self.checkUnusedImports();
+    self.checkAllUnsafeOptionalUnwraps();
 }
 
 fn collectAllIdentifiers(self: *Linter) void {
@@ -621,6 +622,134 @@ fn checkUselessErrorReturn(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.fu
     const name = self.tree.tokenSlice(name_token);
     const loc = self.tree.tokenLocation(0, name_token);
     self.report(loc, .Z020, name);
+}
+
+fn checkAllUnsafeOptionalUnwraps(self: *Linter) void {
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (self.tree.nodeTag(node) == .unwrap_optional) {
+            // Skip unwraps inside test blocks - runtime assertions are common there
+            if (self.isInTestBlock(node)) continue;
+            self.checkSingleUnsafeUnwrap(node);
+        }
+    }
+}
+
+fn isInTestBlock(self: *Linter, node: Ast.Node.Index) bool {
+    // Check if this node is within any test_decl block
+    for (0..self.tree.nodes.len) |i| {
+        const test_node: Ast.Node.Index = @enumFromInt(i);
+        if (self.tree.nodeTag(test_node) != .test_decl) continue;
+        // test_decl data is opt_token_and_node: (name_token, block_node)
+        const data = self.tree.nodeData(test_node).opt_token_and_node;
+        const block_node = data[1];
+        if (self.nodeIsDescendantOf(node, block_node)) return true;
+    }
+    return false;
+}
+
+fn checkSingleUnsafeUnwrap(self: *Linter, node: Ast.Node.Index) void {
+    // Get the expression being unwrapped (the LHS of .?)
+    const data = self.tree.nodeData(node).node_and_token;
+    const unwrapped_expr = data[0];
+
+    // Get the base variable name from the expression
+    const var_name = self.getBaseVarName(unwrapped_expr) orelse return;
+
+    // Check if this unwrap is protected by a null check in an ancestor if statement
+    if (self.isProtectedByNullCheck(node, var_name)) return;
+
+    // Report unsafe unwrap
+    const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(node));
+    self.report(loc, .Z021, var_name);
+}
+
+fn isProtectedByNullCheck(self: *Linter, node: Ast.Node.Index, var_name: []const u8) bool {
+    // Walk up the tree looking for if statements that null-check this variable
+    // We need to find parent nodes - but AST doesn't have parent pointers
+    // So we scan all if nodes and check if this unwrap is in their then branch
+    for (0..self.tree.nodes.len) |i| {
+        const if_node: Ast.Node.Index = @enumFromInt(i);
+        const tag = self.tree.nodeTag(if_node);
+        if (tag != .@"if" and tag != .if_simple) continue;
+
+        const if_full = self.tree.fullIf(if_node) orelse continue;
+
+        // Check if this if null-checks our variable
+        const checked_var = self.getIfNullCheckedVar(if_full) orelse continue;
+        if (!std.mem.eql(u8, checked_var, var_name)) continue;
+
+        // Check if our unwrap node is within the then branch
+        if (self.nodeIsDescendantOf(node, if_full.ast.then_expr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn getIfNullCheckedVar(self: *Linter, if_full: Ast.full.If) ?[]const u8 {
+    // Payload capture: `if (opt) |val|`
+    if (if_full.payload_token != null) {
+        return self.getBaseVarName(if_full.ast.cond_expr);
+    }
+    // != null comparison: `if (x != null)`
+    return self.extractNullCheckVar(if_full.ast.cond_expr);
+}
+
+fn nodeIsDescendantOf(self: *Linter, needle: Ast.Node.Index, haystack: Ast.Node.Index) bool {
+    if (needle == haystack) return true;
+
+    // Get the token range of the haystack node
+    const haystack_first = self.tree.firstToken(haystack);
+    const haystack_last = self.tree.lastToken(haystack);
+    const needle_first = self.tree.firstToken(needle);
+    const needle_last = self.tree.lastToken(needle);
+
+    // Check if needle's tokens are within haystack's token range
+    return needle_first >= haystack_first and needle_last <= haystack_last;
+}
+
+fn getBaseVarName(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
+    const tag = self.tree.nodeTag(node);
+    switch (tag) {
+        .identifier => return self.tree.tokenSlice(self.tree.nodeMainToken(node)),
+        .field_access => {
+            // For field access like `foo.bar`, return the full expression source
+            return self.getNodeSource(node);
+        },
+        .unwrap_optional => {
+            // For `x.?.y`, get base from lhs
+            const data = self.tree.nodeData(node).node_and_token;
+            return self.getBaseVarName(data[0]);
+        },
+        else => return null,
+    }
+}
+
+fn extractNullCheckVar(self: *Linter, cond_node: Ast.Node.Index) ?[]const u8 {
+    const tag = self.tree.nodeTag(cond_node);
+
+    // Look for `x != null` pattern
+    if (tag == .bang_equal) {
+        const data = self.tree.nodeData(cond_node).node_and_node;
+        const lhs = data[0];
+        const rhs = data[1];
+
+        // Check if either side is `null`
+        if (self.isNullLiteral(rhs)) {
+            return self.getBaseVarName(lhs);
+        }
+        if (self.isNullLiteral(lhs)) {
+            return self.getBaseVarName(rhs);
+        }
+    }
+
+    return null;
+}
+
+fn isNullLiteral(self: *Linter, node: Ast.Node.Index) bool {
+    if (self.tree.nodeTag(node) != .identifier) return false;
+    return std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(node)), "null");
 }
 
 fn hasInferredErrorUnion(self: *Linter, return_type: Ast.Node.Index) bool {
@@ -2304,5 +2433,88 @@ test "Z020: return call is conservative ok" {
     linter.lint();
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z020);
+    }
+}
+
+test "Z021: unsafe optional unwrap without null check" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(x: ?u32) u32 {
+        \\    return x.?;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z021) {
+            found = true;
+            try std.testing.expectEqualStrings("x", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z021: optional unwrap after payload capture is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(x: ?u32) u32 {
+        \\    if (x) |_| {
+        \\        return x.?;
+        \\    }
+        \\    return 0;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z021);
+    }
+}
+
+test "Z021: optional unwrap after != null check is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(x: ?u32) u32 {
+        \\    if (x != null) {
+        \\        return x.?;
+        \\    }
+        \\    return 0;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z021);
+    }
+}
+
+test "Z021: optional unwrap in else branch should warn" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(x: ?u32) u32 {
+        \\    if (x != null) {
+        \\        return 1;
+        \\    } else {
+        \\        return x.?;
+        \\    }
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z021) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z021: optional unwrap in test block is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\test "example" {
+        \\    const x: ?u32 = 5;
+        \\    _ = x.?;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z021);
     }
 }
