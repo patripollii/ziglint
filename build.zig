@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);
 
-    const lint_step = addLint(b, exe, &.{ "src", "build.zig" });
+    const lint_step = addLint(b, exe, &.{ b.path("src"), b.path("build.zig") });
     test_step.dependOn(lint_step);
 }
 
@@ -56,13 +56,13 @@ pub fn build(b: *std.Build) void {
 /// Example usage in a downstream project:
 /// ```zig
 /// const ziglint_dep = b.dependency("ziglint", .{ .optimize = .ReleaseFast });
-/// const lint_step = ziglint.addLint(b, ziglint_dep, &.{ "src", "build.zig" });
+/// const lint_step = ziglint.addLint(b, ziglint_dep, &.{ b.path("src"), b.path("build.zig") });
 /// b.step("lint", "Run ziglint").dependOn(lint_step);
 /// ```
 pub fn addLint(
     b: *std.Build,
     ziglint_dep: anytype,
-    paths: []const []const u8,
+    paths: []const std.Build.LazyPath,
 ) *std.Build.Step {
     const exe = switch (@TypeOf(ziglint_dep)) {
         *std.Build.Step.Compile => ziglint_dep,
@@ -72,7 +72,8 @@ pub fn addLint(
     };
 
     const run = b.addRunArtifact(exe);
-    run.addArgs(paths);
+    run.has_side_effects = true;
+    for (paths) |path| run.addDirectoryArg(path);
     run.expectExitCode(0);
     return &run.step;
 }
