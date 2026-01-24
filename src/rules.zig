@@ -18,6 +18,9 @@ pub const Rule = enum(u16) {
     Z016 = 16,
     Z017 = 17,
     Z018 = 18,
+    Z019 = 19,
+    Z020 = 20,
+    Z021 = 21,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -91,6 +94,22 @@ pub const Rule = enum(u16) {
                 try writer.print("redundant {s}@as{s}{s}({s}{s}{s}{s}, ...){s}: type {s}{s}{s} already known from context", .{
                     b, r, d, r, m, context, d, r, m, context, r,
                 });
+            },
+            // @This() in named struct - use the type name
+            .Z019 => {
+                try writer.print("{s}@This(){s} used in named struct; use {s}'{s}'{s} instead", .{ b, r, y, context, r });
+            },
+            // inline @This() - assign to a constant
+            .Z020 => {
+                try writer.print("{s}@This(){s} should be assigned to a constant", .{ b, r });
+            },
+            // file-struct @This() alias should match filename
+            // context is "alias\x00expected" format
+            .Z021 => {
+                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const alias = context[0..sep];
+                const expected = if (sep < context.len) context[sep + 1 ..] else context;
+                try writer.print("{s}@This(){s} alias {s}'{s}'{s} should match filename {s}'{s}'{s}", .{ b, r, y, alias, r, y, expected, r });
             },
         }
     }

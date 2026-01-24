@@ -22,6 +22,7 @@ imported_types: std.StringHashMapUnmanaged(void) = .empty,
 import_bindings: std.StringHashMapUnmanaged(ImportInfo) = .empty,
 used_identifiers: std.StringHashMapUnmanaged(void) = .empty,
 current_fn_return_type: Ast.Node.OptionalIndex = .none,
+parent_map: []Ast.Node.OptionalIndex = &.{},
 
 const ImportInfo = struct {
     name_token: Ast.TokenIndex,
@@ -114,6 +115,9 @@ pub fn deinit(self: *Linter) void {
     self.imported_types.deinit(self.allocator);
     self.import_bindings.deinit(self.allocator);
     self.used_identifiers.deinit(self.allocator);
+    if (self.parent_map.len > 0) {
+        self.allocator.free(self.parent_map);
+    }
 }
 
 pub fn lint(self: *Linter) void {
@@ -123,12 +127,14 @@ pub fn lint(self: *Linter) void {
     self.checkFileAsStruct();
     self.buildPublicTypesMap();
     self.collectAllIdentifiers();
+    self.buildParentMap();
 
     for (self.tree.rootDecls()) |node| {
         self.visitNode(node);
     }
 
     self.checkUnusedImports();
+    self.checkThisBuiltin();
 }
 
 fn collectAllIdentifiers(self: *Linter) void {
@@ -186,6 +192,284 @@ fn checkUnusedImports(self: *Linter) void {
             self.report(loc, .Z013, name);
         }
     }
+}
+
+fn buildParentMap(self: *Linter) void {
+    self.parent_map = self.allocator.alloc(Ast.Node.OptionalIndex, self.tree.nodes.len) catch return;
+    @memset(self.parent_map, .none);
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const children = self.getNodeChildren(node);
+        for (children.slice()) |child| {
+            self.parent_map[@intFromEnum(child)] = node.toOptional();
+        }
+    }
+}
+
+const ChildList = struct {
+    items: [8]Ast.Node.Index = undefined,
+    len: usize = 0,
+
+    fn append(self: *ChildList, item: Ast.Node.Index) void {
+        if (self.len < 8) {
+            self.items[self.len] = item;
+            self.len += 1;
+        }
+    }
+
+    fn slice(self: *const ChildList) []const Ast.Node.Index {
+        return self.items[0..self.len];
+    }
+};
+
+fn getNodeChildren(self: *Linter, node: Ast.Node.Index) ChildList {
+    var children: ChildList = .{};
+    const tag = self.tree.nodeTag(node);
+
+    switch (tag) {
+        // fn_decl: node_and_node = [fn_proto, body]
+        .fn_decl => {
+            const pair = self.tree.nodeData(node).node_and_node;
+            children.append(pair[0]);
+            children.append(pair[1]);
+        },
+
+        // test_decl: opt_token_and_node = [name_token, block]
+        .test_decl => {
+            const data = self.tree.nodeData(node).opt_token_and_node;
+            children.append(data[1]);
+        },
+
+        // Var decl types - use fullVarDecl for safe access
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+            const var_decl = self.tree.fullVarDecl(node) orelse return children;
+            if (var_decl.ast.type_node.unwrap()) |n| children.append(n);
+            if (var_decl.ast.init_node.unwrap()) |n| children.append(n);
+        },
+
+        // Builtin calls - opt_node_and_opt_node
+        .builtin_call_two, .builtin_call_two_comma => {
+            const data = self.tree.nodeData(node).opt_node_and_opt_node;
+            if (data[0].unwrap()) |n| children.append(n);
+            if (data[1].unwrap()) |n| children.append(n);
+        },
+
+        // Container declarations (structs, enums, unions) - use fullContainerDecl for safe access
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => {
+            var buf: [2]Ast.Node.Index = undefined;
+            const container = self.tree.fullContainerDecl(&buf, node) orelse return children;
+            for (container.ast.members) |member| {
+                children.append(member);
+            }
+        },
+
+        // Block - use blockStatements for safe access
+        .block, .block_semicolon => {
+            var buf: [2]Ast.Node.Index = undefined;
+            const stmts = self.tree.blockStatements(&buf, node) orelse return children;
+            for (stmts) |stmt| children.append(stmt);
+        },
+
+        .block_two, .block_two_semicolon => {
+            const data = self.tree.nodeData(node).opt_node_and_opt_node;
+            if (data[0].unwrap()) |n| children.append(n);
+            if (data[1].unwrap()) |n| children.append(n);
+        },
+
+        else => {},
+    }
+
+    return children;
+}
+
+fn checkThisBuiltin(self: *Linter) void {
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const tag = self.tree.nodeTag(node);
+
+        // Look for @This() calls
+        if (tag != .builtin_call_two and tag != .builtin_call_two_comma) continue;
+        const main_token = self.tree.nodeMainToken(node);
+        const builtin_name = self.tree.tokenSlice(main_token);
+        if (!std.mem.eql(u8, builtin_name, "@This")) continue;
+
+        // Found @This() - check if it's valid
+        const loc = self.tree.tokenLocation(0, main_token);
+
+        // Check 1: Is it in the form `const X = @This();`?
+        const parent = self.parent_map[@intFromEnum(node)].unwrap() orelse {
+            // Z020: inline @This()
+            self.report(loc, .Z020, "");
+            continue;
+        };
+
+        const parent_tag = self.tree.nodeTag(parent);
+        const const_decl_info: ?struct { name: []const u8 } = switch (parent_tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => blk: {
+                const var_decl = self.tree.fullVarDecl(parent) orelse break :blk null;
+                const mut_token = self.tree.tokenSlice(var_decl.ast.mut_token);
+                const init_node = var_decl.ast.init_node.unwrap() orelse break :blk null;
+                if (!std.mem.eql(u8, mut_token, "const") or init_node != node) break :blk null;
+                const name_token = var_decl.ast.mut_token + 1;
+                break :blk .{ .name = self.tree.tokenSlice(name_token) };
+            },
+            else => null,
+        };
+
+        if (const_decl_info == null) {
+            // Z020: inline @This()
+            self.report(loc, .Z020, "");
+            continue;
+        }
+
+        const alias_name = const_decl_info.?.name;
+
+        // Check 2: Is the enclosing struct anonymous?
+        const struct_name = self.findEnclosingStructName(node);
+        if (struct_name) |name| {
+            // Z019: @This() in named struct
+            self.report(loc, .Z019, name);
+            continue;
+        }
+
+        // Check 3: If at file level in a file-as-struct (has top-level fields), alias should match filename
+        if (self.isAtFileLevel(node) and self.hasTopLevelFields()) {
+            const basename = std.fs.path.basename(self.path);
+            const expected = if (std.mem.endsWith(u8, basename, ".zig"))
+                basename[0 .. basename.len - 4]
+            else
+                basename;
+
+            // Allow "Self" or the filename (case-insensitive)
+            const is_self = std.mem.eql(u8, alias_name, "Self");
+            const matches_filename = std.ascii.eqlIgnoreCase(alias_name, expected);
+            if (!is_self and !matches_filename) {
+                // Z021: alias doesn't match filename or Self
+                const context = self.allocator.alloc(u8, alias_name.len + 1 + expected.len) catch continue;
+                @memcpy(context[0..alias_name.len], alias_name);
+                context[alias_name.len] = 0;
+                @memcpy(context[alias_name.len + 1 ..], expected);
+                self.allocated_contexts.append(self.allocator, context) catch {};
+                self.report(loc, .Z021, context);
+            }
+        }
+    }
+}
+
+fn hasTopLevelFields(self: *Linter) bool {
+    for (self.tree.rootDecls()) |node| {
+        const tag = self.tree.nodeTag(node);
+        if (tag == .container_field_init or tag == .container_field) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isAtFileLevel(self: *Linter, start_node: Ast.Node.Index) bool {
+    var current = start_node;
+
+    while (true) {
+        const parent_opt = self.parent_map[@intFromEnum(current)];
+        const parent = parent_opt.unwrap() orelse return true; // No parent = root level
+        const parent_tag = self.tree.nodeTag(parent);
+
+        // If we hit a container, fn, or test, we're not at file level
+        switch (parent_tag) {
+            .container_decl,
+            .container_decl_trailing,
+            .container_decl_two,
+            .container_decl_two_trailing,
+            .container_decl_arg,
+            .container_decl_arg_trailing,
+            .tagged_union,
+            .tagged_union_trailing,
+            .tagged_union_two,
+            .tagged_union_two_trailing,
+            .tagged_union_enum_tag,
+            .tagged_union_enum_tag_trailing,
+            .fn_decl,
+            .test_decl,
+            => return false,
+            else => {},
+        }
+
+        current = parent;
+    }
+}
+
+fn findEnclosingStructName(self: *Linter, start_node: Ast.Node.Index) ?[]const u8 {
+    var current = start_node;
+    var enclosing_container: ?Ast.Node.Index = null;
+
+    // First pass: find the enclosing container
+    while (true) {
+        const parent_opt = self.parent_map[@intFromEnum(current)];
+        const parent = parent_opt.unwrap() orelse break;
+        const parent_tag = self.tree.nodeTag(parent);
+
+        const is_container = switch (parent_tag) {
+            .container_decl,
+            .container_decl_trailing,
+            .container_decl_two,
+            .container_decl_two_trailing,
+            .container_decl_arg,
+            .container_decl_arg_trailing,
+            => true,
+            else => false,
+        };
+
+        if (is_container) {
+            enclosing_container = parent;
+            break;
+        }
+
+        current = parent;
+    }
+
+    const container = enclosing_container orelse return null;
+
+    // Second pass: check if container is inside a function/test block
+    // If so, the struct name isn't accessible from inside, so @This() is valid
+    current = container;
+    while (true) {
+        const parent_opt = self.parent_map[@intFromEnum(current)];
+        const parent = parent_opt.unwrap() orelse break;
+        const parent_tag = self.tree.nodeTag(parent);
+
+        if (parent_tag == .fn_decl or parent_tag == .test_decl) {
+            return null; // Local struct - name not accessible
+        }
+
+        current = parent;
+    }
+
+    // Container is at module level - check if it's named
+    const container_parent_opt = self.parent_map[@intFromEnum(container)];
+    const container_parent = container_parent_opt.unwrap() orelse return null;
+    const container_parent_tag = self.tree.nodeTag(container_parent);
+
+    return switch (container_parent_tag) {
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => blk: {
+            const var_decl = self.tree.fullVarDecl(container_parent) orelse break :blk null;
+            const name_token = var_decl.ast.mut_token + 1;
+            break :blk self.tree.tokenSlice(name_token);
+        },
+        else => null, // Anonymous (returned, passed as arg, etc.)
+    };
 }
 
 fn checkFileAsStruct(self: *Linter) void {
@@ -1205,7 +1489,7 @@ test "Z006: allow underscore prefix" {
 }
 
 test "Z006: allow type alias with @This()" {
-    var linter: Linter = .init(std.testing.allocator, "const MyType = @This();", "test.zig");
+    var linter: Linter = .init(std.testing.allocator, "const MyType = @This();", "MyType.zig");
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
@@ -1929,5 +2213,144 @@ test "Z016: simple assert is ok" {
     linter.lint();
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z016);
+    }
+}
+
+test "Z019: @This() in named struct should warn" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    const Self = @This();
+        \\};
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z019) {
+            found = true;
+            try std.testing.expectEqualStrings("Foo", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z019: @This() in anonymous struct is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn Generic(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct {
+        \\        const Self = @This();
+        \\    };
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
+test "Z019: nested named struct should warn" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Outer = struct {
+        \\    const Inner = struct {
+        \\        const Self = @This();
+        \\    };
+        \\};
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z019) {
+            found = true;
+            try std.testing.expectEqualStrings("Inner", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z019: @This() in local struct (inside fn) is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    const Local = struct {
+        \\        const Self = @This();
+        \\    };
+        \\    _ = Local;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
+test "Z019: @This() in local struct (inside test) is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\test {
+        \\    const Local = struct {
+        \\        const Self = @This();
+        \\    };
+        \\    _ = Local;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
+test "Z020: inline @This() should warn" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn method() @This() { return undefined; }
+        \\};
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z020) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z021: file-struct @This() alias should match filename or Self" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const SelfType = @This();
+        \\value: u32,
+    , "Writer.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z021) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z021: file-struct @This() alias matching filename is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Writer = @This();
+        \\value: u32,
+    , "Writer.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z021);
+    }
+}
+
+test "Z021: file-struct @This() alias Self is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Self = @This();
+        \\value: u32,
+    , "Writer.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z021);
     }
 }
