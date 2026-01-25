@@ -200,6 +200,42 @@ fn buildParentMap(self: *Linter) void {
 
     for (0..self.tree.nodes.len) |i| {
         const node: Ast.Node.Index = @enumFromInt(i);
+
+        // Handle nodes with potentially many children directly
+        const tag = self.tree.nodeTag(node);
+        switch (tag) {
+            .block, .block_semicolon => {
+                var buf: [2]Ast.Node.Index = undefined;
+                const stmts = self.tree.blockStatements(&buf, node) orelse continue;
+                for (stmts) |stmt| {
+                    self.parent_map[@intFromEnum(stmt)] = node.toOptional();
+                }
+                continue;
+            },
+            .container_decl,
+            .container_decl_trailing,
+            .container_decl_two,
+            .container_decl_two_trailing,
+            .container_decl_arg,
+            .container_decl_arg_trailing,
+            .tagged_union,
+            .tagged_union_trailing,
+            .tagged_union_two,
+            .tagged_union_two_trailing,
+            .tagged_union_enum_tag,
+            .tagged_union_enum_tag_trailing,
+            => {
+                var buf: [2]Ast.Node.Index = undefined;
+                const container = self.tree.fullContainerDecl(&buf, node) orelse continue;
+                for (container.ast.members) |member| {
+                    self.parent_map[@intFromEnum(member)] = node.toOptional();
+                }
+                continue;
+            },
+            else => {},
+        }
+
+        // Use ChildList for nodes with bounded children
         const children = self.getNodeChildren(node);
         for (children.slice()) |child| {
             self.parent_map[@intFromEnum(child)] = node.toOptional();
