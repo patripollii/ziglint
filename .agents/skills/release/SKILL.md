@@ -7,9 +7,10 @@ description: Publishes ziglint releases. Use when releasing, versioning, tagging
 
 ## Quick Release Checklist
 
-1. Write release notes in `docs/releases/vX.Y.Z.md`
-2. Commit changes
-3. Tag and push: `git tag vX.Y.Z && git push && git push --tags`
+1. Update version in `build.zig.zon`
+2. Write release notes in `docs/releases/vX.Y.Z.md`
+3. Commit changes
+4. Tag and push: `git tag vX.Y.Z && git push && git push --tags`
 
 ## Release Notes
 
