@@ -1197,13 +1197,36 @@ fn isSnakeCase(name: []const u8) bool {
     return true;
 }
 
+/// Returns true if the identifier is a primitive type (e.g., i32, u8, f64, bool, etc.)
+fn isPrimitiveType(name: []const u8) bool {
+    const primitives = [_][]const u8{
+        "bool",     "true",         "false",          "null",        "undefined",
+        "noreturn", "void",         "anyopaque",      "anyerror",    "anytype",
+        "anyframe", "comptime_int", "comptime_float", "isize",       "usize",
+        "c_char",   "c_short",      "c_ushort",       "c_int",       "c_uint",
+        "c_long",   "c_ulong",      "c_longlong",     "c_ulonglong", "c_longdouble",
+        "f16",      "f32",          "f64",            "f80",         "f128",
+    };
+    for (primitives) |p| {
+        if (std.mem.eql(u8, name, p)) return true;
+    }
+    // Check for integer types: i{N}, u{N} where N is digits
+    if (name.len >= 2 and (name[0] == 'i' or name[0] == 'u')) {
+        for (name[1..]) |c| {
+            if (c < '0' or c > '9') return false;
+        }
+        return true;
+    }
+    return false;
+}
+
 fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
     const tag = self.tree.nodeTag(init_node);
     return switch (tag) {
         .identifier => blk: {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(init_node));
-            break :blk std.mem.eql(u8, token, "type") or isPascalCase(token);
+            break :blk std.mem.eql(u8, token, "type") or isPascalCase(token) or isPrimitiveType(token);
         },
         .field_access => blk: {
             const data = self.tree.nodeData(init_node).node_and_token;
@@ -1572,6 +1595,13 @@ test "Z006: detect field access ending in snake_case" {
 
 test "Z006: allow PascalCase identifier assignment" {
     var linter: Linter = .init(std.testing.allocator, "const MyType = SomeType;", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z006: allow type alias with primitive type" {
+    var linter: Linter = .init(std.testing.allocator, "const Days = i32; const Nanoseconds = i128; const Float = f64;", "test.zig");
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
