@@ -325,6 +325,29 @@ fn getNodeChildren(self: *Linter, node: Ast.Node.Index) ChildList {
             if (data[1].unwrap()) |n| children.append(n);
         },
 
+        // If expressions
+        .if_simple, .@"if" => {
+            const full_if = self.tree.fullIf(node) orelse return children;
+            children.append(full_if.ast.cond_expr);
+            children.append(full_if.ast.then_expr);
+            if (full_if.ast.else_expr.unwrap()) |n| children.append(n);
+        },
+
+        // While loops
+        .while_simple, .while_cont, .@"while" => {
+            const full_while = self.tree.fullWhile(node) orelse return children;
+            children.append(full_while.ast.cond_expr);
+            children.append(full_while.ast.then_expr);
+            if (full_while.ast.else_expr.unwrap()) |n| children.append(n);
+        },
+
+        // For loops
+        .for_simple, .@"for" => {
+            const full_for = self.tree.fullFor(node) orelse return children;
+            children.append(full_for.ast.then_expr);
+            if (full_for.ast.else_expr.unwrap()) |n| children.append(n);
+        },
+
         else => {},
     }
 
@@ -2366,6 +2389,28 @@ test "Z019: @This() in local struct (inside test) is ok" {
         \\        const Self = @This();
         \\    };
         \\    _ = Local;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z019);
+    }
+}
+
+test "Z019: @This() in local struct inside nested if blocks is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    if (true) {
+        \\        if (true) {
+        \\            if (true) {
+        \\                const Local = struct {
+        \\                    const Self = @This();
+        \\                };
+        \\                _ = Local;
+        \\            }
+        \\        }
+        \\    }
         \\}
     , "test.zig");
     defer linter.deinit();
