@@ -72,10 +72,38 @@ pub fn addLint(
     };
 
     const run = b.addRunArtifact(exe);
-    run.has_side_effects = true;
-    for (paths) |path| run.addDirectoryArg(path);
+    for (paths) |path| {
+        run.addDirectoryArg(path);
+        addPathInputs(run, path);
+    }
     run.expectExitCode(0);
     return &run.step;
+}
+
+fn addPathInputs(run: *std.Build.Step.Run, lazy_path: std.Build.LazyPath) void {
+    // Only handle src_path (from b.path()) - other variants may not be resolved yet
+    const src = switch (lazy_path) {
+        .src_path => |src| src,
+        else => return,
+    };
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const full_path = src.owner.build_root.handle.realpathZ(@ptrCast(src.sub_path), &buf) catch return;
+
+    const stat = std.fs.cwd().statFile(full_path) catch return;
+    if (stat.kind == .directory) {
+        var dir = std.fs.cwd().openDir(full_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+        var walker = dir.walk(std.heap.page_allocator) catch return;
+        defer walker.deinit();
+        while (walker.next() catch null) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".zig")) {
+                run.addFileInput(lazy_path.path(run.step.owner, entry.path));
+            }
+        }
+    } else if (stat.kind == .file) {
+        run.addFileInput(lazy_path);
+    }
 }
 
 fn getVersion(b: *std.Build) []const u8 {

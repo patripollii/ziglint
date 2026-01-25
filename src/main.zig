@@ -21,14 +21,18 @@ pub fn main() !u8 {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const stdout_file = std.fs.File.stdout();
-    const use_color = detectColorSupport(stdout_file);
+    const stderr_file = std.fs.File.stderr();
+    const use_color = detectColorSupport(stderr_file);
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout = stdout_file.writer(&stdout_buf);
+    var stdout = std.fs.File.stdout().writer(&stdout_buf);
     defer stdout.end() catch {};
 
-    const config = parseArgs(allocator, &stdout.interface) catch |err| switch (err) {
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr = stderr_file.writer(&stderr_buf);
+    defer stderr.end() catch {};
+
+    const config = parseArgs(allocator, &stderr.interface) catch |err| switch (err) {
         error.InvalidArgs => return 1,
         else => return err,
     };
@@ -38,13 +42,13 @@ pub fn main() !u8 {
         return 1;
     }
 
-    const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(allocator, &stdout.interface) catch null;
+    const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(allocator, &stderr.interface) catch null;
 
     var total_issues: usize = 0;
     for (config.paths) |path| {
         const abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch path;
         const project_root = findProjectRoot(abs_path);
-        total_issues += try lintPath(allocator, path, zig_lib_path, config.ignored_rules, use_color, project_root, &stdout.interface);
+        total_issues += try lintPath(allocator, path, zig_lib_path, config.ignored_rules, use_color, project_root, &stderr.interface);
     }
 
     return if (total_issues > 0) 1 else 0;
