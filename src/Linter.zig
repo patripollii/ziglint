@@ -1166,6 +1166,17 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
         => {
             self.checkRedundantAsInArrayInit(node);
         },
+        .struct_init_one,
+        .struct_init_one_comma,
+        .struct_init_dot_two,
+        .struct_init_dot_two_comma,
+        .struct_init_dot,
+        .struct_init_dot_comma,
+        .struct_init,
+        .struct_init_comma,
+        => {
+            self.checkRedundantAsInStructInit(node);
+        },
         else => {},
     }
 
@@ -1635,6 +1646,86 @@ fn getTypeNodeNameFromTree(_: *Linter, tree: *const Ast, type_node: Ast.Node.Ind
         .identifier => tree.tokenSlice(tree.nodeMainToken(type_node)),
         else => null,
     };
+}
+
+fn checkRedundantAsInStructInit(self: *Linter, node: Ast.Node.Index) void {
+    var buf: [2]Ast.Node.Index = undefined;
+    const struct_init = self.tree.fullStructInit(&buf, node) orelse return;
+    if (struct_init.ast.fields.len == 0) return;
+
+    // Determine the struct type name
+    const struct_type_name = self.resolveStructInitTypeName(node, struct_init) orelse return;
+
+    for (struct_init.ast.fields) |field_value| {
+        const as_type_name = self.getAsTypeName(field_value) orelse continue;
+
+        // Get field name: token before '=' before the value expression
+        const value_main_token = self.tree.nodeMainToken(field_value);
+        if (value_main_token < 2) continue;
+        const field_name_token = value_main_token - 2;
+        if (self.tree.tokenTag(field_name_token) != .identifier) continue;
+        const field_name = self.tree.tokenSlice(field_name_token);
+
+        const field_type_name = self.findContainerFieldType(struct_type_name, field_name) orelse continue;
+        if (std.mem.eql(u8, as_type_name, field_type_name)) {
+            const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(field_value));
+            self.report(loc, .Z029, as_type_name);
+        }
+    }
+}
+
+fn resolveStructInitTypeName(self: *Linter, node: Ast.Node.Index, struct_init: Ast.full.StructInit) ?[]const u8 {
+    // Case 1: explicit type expression (e.g., Foo{ .x = 1 })
+    if (struct_init.ast.type_expr.unwrap()) |type_expr| {
+        return self.getTypeNodeName(type_expr);
+    }
+
+    // Case 2: anonymous init — walk parent_map to find type context
+    if (self.parent_map.len == 0) return null;
+    const parent = self.parent_map[@intFromEnum(node)].unwrap() orelse return null;
+    const parent_tag = self.tree.nodeTag(parent);
+    switch (parent_tag) {
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+            const var_decl = self.tree.fullVarDecl(parent) orelse return null;
+            const type_node = var_decl.ast.type_node.unwrap() orelse return null;
+            return self.getTypeNodeName(type_node);
+        },
+        else => return null,
+    }
+}
+
+fn findContainerFieldType(self: *Linter, struct_type_name: []const u8, field_name: []const u8) ?[]const u8 {
+    return self.findContainerFieldTypeInTree(&self.tree, struct_type_name, field_name);
+}
+
+fn findContainerFieldTypeInTree(self: *Linter, tree: *const Ast, struct_type_name: []const u8, field_name: []const u8) ?[]const u8 {
+    _ = self;
+    for (tree.rootDecls()) |decl_node| {
+        const tag = tree.nodeTag(decl_node);
+        switch (tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = tree.fullVarDecl(decl_node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                if (!std.mem.eql(u8, tree.tokenSlice(name_token), struct_type_name)) continue;
+                const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+
+                var container_buf: [2]Ast.Node.Index = undefined;
+                const container = tree.fullContainerDecl(&container_buf, init_node) orelse continue;
+                for (container.ast.members) |member| {
+                    const field = tree.fullContainerField(member) orelse continue;
+                    if (!std.mem.eql(u8, tree.tokenSlice(field.ast.main_token), field_name)) continue;
+                    const type_node = field.ast.type_expr.unwrap() orelse return null;
+                    const field_type_tag = tree.nodeTag(type_node);
+                    return switch (field_type_tag) {
+                        .identifier => tree.tokenSlice(tree.nodeMainToken(type_node)),
+                        else => null,
+                    };
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
@@ -4146,4 +4237,180 @@ test "Z029: multiple args with redundant @as" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(2, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as in struct field init" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    x: u32,
+        \\    y: u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .x = @as(u32, 1), .y = 2 };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: allow @as with different type in struct field init" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    x: u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .x = @as(u16, 1) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as in explicit struct init" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    x: u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f = Foo{ .x = @as(u32, 1) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: no false positive on clean call args" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(x: u32) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(42);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip unresolvable function call" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    unknown_fn(@as(u32, 1));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip call with anytype param" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(x: anytype) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@as(u32, 1));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect multiple redundant @as in array init" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = [_]u32{ @as(u32, 1), @as(u32, 2), 3 };
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip array init without type annotation" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = .{ @as(u32, 1), @as(u32, 2) };
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect in sized array init" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = [2]u32{ @as(u32, 1), @as(u32, 2) };
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip struct init without known type" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const f = .{ .x = @as(u32, 1) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect multiple redundant @as in struct fields" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    x: u32,
+        \\    y: u32,
+        \\};
+        \\pub fn main() void {
+        \\    const f: Foo = .{ .x = @as(u32, 1), .y = @as(u32, 2) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: skip struct field with unknown type in container" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const f: UnknownType = .{ .x = @as(u32, 1) };
+        \\    _ = f;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: mixed match and mismatch in call args" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(a: u32, b: u16) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@as(u32, 1), @as(u32, 2));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
 }
