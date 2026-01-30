@@ -196,6 +196,67 @@ pub fn isTypeRef(self: *TypeResolver, module_path: []const u8, node: Ast.Node.In
     return self.nodeIsTypeRef(&mod.tree, node, module_path);
 }
 
+/// Returns true if field_name is a container-level declaration (const, non-method fn)
+/// in the given type, rather than a struct field.
+pub fn isContainerLevelDecl(self: *TypeResolver, receiver_type: TypeInfo, field_name: []const u8) bool {
+    switch (receiver_type) {
+        .user_type => |u| {
+            const mod = self.graph.getModule(u.module_path) orelse return false;
+            return self.isDeclInContainer(&mod.tree, u.name, field_name);
+        },
+        else => return false,
+    }
+}
+
+fn isDeclInContainer(self: *TypeResolver, tree: *const Ast, type_name: []const u8, decl_name: []const u8) bool {
+    const type_node = self.findTypeDecl(tree, type_name) orelse return false;
+    if (!isContainerDecl(tree.nodeTag(type_node))) return false;
+
+    var buf: [2]Ast.Node.Index = undefined;
+    const container = tree.fullContainerDecl(&buf, type_node) orelse return false;
+
+    for (container.ast.members) |member| {
+        switch (tree.nodeTag(member)) {
+            .fn_decl => {
+                var fn_buf: [1]Ast.Node.Index = undefined;
+                const fn_proto = tree.fullFnProto(&fn_buf, member) orelse continue;
+                const fn_name_token = fn_proto.name_token orelse continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(fn_name_token), decl_name)) continue;
+                return !fnHasReceiver(tree, fn_proto, type_name);
+            },
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = tree.fullVarDecl(member) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                if (std.mem.eql(u8, tree.tokenSlice(name_token), decl_name)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn fnHasReceiver(tree: *const Ast, fn_proto: Ast.full.FnProto, container_name: []const u8) bool {
+    var it = fn_proto.iterate(tree);
+    const first_param = it.next() orelse return false;
+    const type_node = first_param.type_expr orelse return false;
+    return isReceiverType(tree, type_node, container_name);
+}
+
+fn isReceiverType(tree: *const Ast, node: Ast.Node.Index, container_name: []const u8) bool {
+    return switch (tree.nodeTag(node)) {
+        .builtin_call_two, .builtin_call_two_comma => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@This"),
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => blk: {
+            const ptr_type = tree.fullPtrType(node) orelse break :blk false;
+            break :blk isReceiverType(tree, ptr_type.ast.child_type, container_name);
+        },
+        .identifier => blk: {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            break :blk std.mem.eql(u8, name, "Self") or std.mem.eql(u8, name, container_name);
+        },
+        else => false,
+    };
+}
+
 /// Resolves a stdlib path like "fs.File" to find the method.
 /// Follows the import chain: std.zig -> fs.zig -> File type -> method
 fn findMethodInStdlib(self: *TypeResolver, path: []const u8, method_name: []const u8) ?MethodDef {

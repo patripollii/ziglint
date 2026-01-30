@@ -145,6 +145,7 @@ pub fn lint(self: *Linter) void {
     self.checkThisBuiltin();
     self.checkCatchReturnAll();
     self.checkEmptyCatchAll();
+    self.checkInstanceDeclAccess();
 }
 
 fn collectAllIdentifiers(self: *Linter) void {
@@ -1347,6 +1348,39 @@ fn checkEmptyCatchAll(self: *Linter) void {
         const catch_token = self.tree.nodeMainToken(node);
         const loc = self.tree.tokenLocation(0, catch_token);
         self.report(loc, .Z026, "");
+    }
+}
+
+fn checkInstanceDeclAccess(self: *Linter) void {
+    const resolver = self.type_resolver orelse return;
+    const mod_path = self.module_path orelse return;
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (self.tree.nodeTag(node) != .field_access) continue;
+
+        const data = self.tree.nodeData(node).node_and_token;
+        const lhs_node = data[0];
+        const field_token = data[1];
+        const field_name = self.tree.tokenSlice(field_token);
+
+        if (resolver.isTypeRef(mod_path, lhs_node)) continue;
+
+        const lhs_type = resolver.typeOf(mod_path, lhs_node);
+        if (!resolver.isContainerLevelDecl(lhs_type, field_name)) continue;
+
+        const type_name = switch (lhs_type) {
+            .user_type => |u| u.name,
+            else => continue,
+        };
+
+        const loc = self.tree.tokenLocation(0, field_token);
+        const context = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{
+            field_name, type_name,
+        }) catch continue;
+        // ziglint-ignore: Z026
+        self.allocated_contexts.append(self.allocator, context) catch {};
+        self.report(loc, .Z027, context);
     }
 }
 
@@ -3393,6 +3427,302 @@ test "Z026: allow non-empty catch" {
     linter.lint();
     for (linter.diagnostics.items) |d| {
         if (d.rule == rules.Rule.Z026) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z027: flag instance accessing const" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const Foo = struct {
+        \\    field: u32,
+        \\    const bar = 42;
+        \\};
+        \\const instance: Foo = .{ .field = 0 };
+        \\pub fn main() void {
+        \\    _ = instance.bar;
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z027) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z027: flag instance accessing static fn" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const Foo = struct {
+        \\    field: u32,
+        \\    fn staticFn() void {}
+        \\};
+        \\const instance: Foo = .{ .field = 0 };
+        \\pub fn main() void {
+        \\    instance.staticFn();
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z027) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z027: allow instance method call" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const Foo = struct {
+        \\    field: u32,
+        \\    fn getField(self: *@This()) u32 {
+        \\        return self.field;
+        \\    }
+        \\};
+        \\const instance: Foo = .{ .field = 0 };
+        \\pub fn main() void {
+        \\    _ = instance.getField();
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z027) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z027: allow field access" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const Foo = struct {
+        \\    field: u32,
+        \\};
+        \\const instance: Foo = .{ .field = 0 };
+        \\pub fn main() void {
+        \\    _ = instance.field;
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z027) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z027: allow type-level access" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const Foo = struct {
+        \\    field: u32,
+        \\    const bar = 42;
+        \\};
+        \\pub fn main() void {
+        \\    _ = Foo.bar;
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z027) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z027: no warning without semantic context" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    const bar = 42;
+        \\};
+        \\const instance: Foo = .{};
+        \\pub fn main() void {
+        \\    _ = instance.bar;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z027) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z027: allow method with Self receiver" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const Foo = struct {
+        \\    const Self = @This();
+        \\    field: u32,
+        \\    fn getField(self: *Self) u32 {
+        \\        return self.field;
+        \\    }
+        \\};
+        \\const instance: Foo = .{ .field = 0 };
+        \\pub fn main() void {
+        \\    _ = instance.getField();
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z027) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z027: allow method with named type receiver" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const Foo = struct {
+        \\    field: u32,
+        \\    fn getField(self: *Foo) u32 {
+        \\        return self.field;
+        \\    }
+        \\};
+        \\const instance: Foo = .{ .field = 0 };
+        \\pub fn main() void {
+        \\    _ = instance.getField();
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z027) {
             try std.testing.expect(false);
         }
     }

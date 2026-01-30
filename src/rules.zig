@@ -28,6 +28,7 @@ pub const Rule = enum(u16) {
     Z024 = 24,
     Z025 = 25,
     Z026 = 26,
+    Z027 = 27,
 
     /// Returns the config struct type for this rule.
     /// All config types have `enabled: bool` (default varies per rule).
@@ -186,6 +187,16 @@ pub const Rule = enum(u16) {
             .Z026 => {
                 try writer.print("empty {s}catch{s} block suppresses errors: {s}`{s}{s}catch{s} {s}{{}}{s}{s}`{s}", .{
                     p, r, d, r, p, r, d, r, d, r,
+                });
+            },
+            // instance.decl -> Type.decl
+            // context is "field_name\x00type_name"
+            .Z027 => {
+                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const field = context[0..sep];
+                const type_name = if (sep < context.len) context[sep + 1 ..] else "";
+                try writer.print("access {s}'{s}'{s} through type {s}'{s}'{s} instead of instance", .{
+                    y, field, r, m, type_name, r,
                 });
             },
         }
