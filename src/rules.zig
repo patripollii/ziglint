@@ -29,6 +29,7 @@ pub const Rule = enum(u16) {
     Z025 = 25,
     Z026 = 26,
     Z027 = 27,
+    Z028 = 28,
 
     /// Returns the config struct type for this rule.
     /// All config types have `enabled: bool` (default varies per rule).
@@ -199,6 +200,7 @@ pub const Rule = enum(u16) {
                     y, field, r, m, type_name, r,
                 });
             },
+            .Z028 => try writer.print("unused declaration {s}'{s}'{s}", .{ y, context, r }),
         }
     }
 };
