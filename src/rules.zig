@@ -27,6 +27,7 @@ pub const Rule = enum(u16) {
     Z023 = 23,
     Z024 = 24,
     Z025 = 25,
+    Z026 = 26,
 
     /// Returns the config struct type for this rule.
     /// All config types have `enabled: bool` (default varies per rule).
@@ -178,6 +179,13 @@ pub const Rule = enum(u16) {
             .Z025 => {
                 try writer.print("redundant {s}catch{s}: {s}`{s}{s}catch{s} {s}|{s}{s}{s}{s}| {s}{s}return{s} {s}{s}{s}`{s} -> use {s}try{s}", .{
                     p, r, d, r, p, r, d, r, y, context, d, r, p, r, y, context, d, r, p, r,
+                });
+            },
+            // suppressed error: empty catch block swallows errors
+            // catch=purple, punctuation=dim
+            .Z026 => {
+                try writer.print("empty {s}catch{s} block suppresses errors: {s}`{s}{s}catch{s} {s}{{}}{s}{s}`{s}", .{
+                    p, r, d, r, p, r, d, r, d, r,
                 });
             },
         }

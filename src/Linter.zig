@@ -144,6 +144,7 @@ pub fn lint(self: *Linter) void {
     self.checkUnusedImports();
     self.checkThisBuiltin();
     self.checkCatchReturnAll();
+    self.checkEmptyCatchAll();
 }
 
 fn collectAllIdentifiers(self: *Linter) void {
@@ -153,6 +154,7 @@ fn collectAllIdentifiers(self: *Linter) void {
         switch (tag) {
             .identifier => {
                 const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+                // ziglint-ignore: Z026
                 self.used_identifiers.put(self.allocator, name, {}) catch {};
             },
             .field_access => {
@@ -164,6 +166,7 @@ fn collectAllIdentifiers(self: *Linter) void {
                 }
                 if (self.tree.nodeTag(current) == .identifier) {
                     const name = self.tree.tokenSlice(self.tree.nodeMainToken(current));
+                    // ziglint-ignore: Z026
                     self.used_identifiers.put(self.allocator, name, {}) catch {};
                 }
             },
@@ -357,6 +360,15 @@ fn getNodeChildren(self: *Linter, node: Ast.Node.Index) ChildList {
             if (full_for.ast.else_expr.unwrap()) |n| children.append(n);
         },
 
+        .@"defer" => {
+            children.append(self.tree.nodeData(node).node);
+        },
+
+        .@"errdefer" => {
+            const data = self.tree.nodeData(node).opt_token_and_node;
+            children.append(data[1]);
+        },
+
         else => {},
     }
 
@@ -431,6 +443,7 @@ fn checkThisBuiltin(self: *Linter) void {
                     @memcpy(context[0..alias_name.len], alias_name);
                     context[alias_name.len] = 0;
                     @memcpy(context[alias_name.len + 1 ..], expected);
+                    // ziglint-ignore: Z026
                     self.allocated_contexts.append(self.allocator, context) catch {};
                     self.report(loc, .Z021, context);
                 }
@@ -583,6 +596,7 @@ fn buildPublicTypesMap(self: *Linter) void {
 
                 // Track imported types (field access ending in PascalCase, e.g., std.mem.Allocator)
                 if (self.isImportedType(var_decl)) {
+                    // ziglint-ignore: Z026
                     self.imported_types.put(self.allocator, name, {}) catch {};
                     continue;
                 }
@@ -590,6 +604,7 @@ fn buildPublicTypesMap(self: *Linter) void {
                 if (!self.isPublicDecl(node)) continue;
                 if (!self.isTypeDecl(var_decl)) continue;
 
+                // ziglint-ignore: Z026
                 self.public_types.put(self.allocator, name, {}) catch {};
             },
             else => {},
@@ -795,6 +810,7 @@ fn checkArgumentOrder(self: *Linter, node: Ast.Node.Index) void {
                 kind.name(),
                 max_kind.name(),
             }) catch continue;
+            // ziglint-ignore: Z026
             self.allocated_contexts.append(self.allocator, context) catch {};
             self.report(loc, .Z023, context);
         }
@@ -961,6 +977,7 @@ fn getFieldAccessPath(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
         pos += p.len;
     }
 
+    // ziglint-ignore: Z026
     self.allocated_contexts.append(self.allocator, result) catch {};
     return result;
 }
@@ -1234,6 +1251,7 @@ fn trackImportBinding(self: *Linter, node: Ast.Node.Index, var_decl: Ast.full.Va
         .name_token = name_token,
         .is_pub = is_pub,
         .is_discard = is_discard,
+        // ziglint-ignore: Z026
     }) catch {};
 }
 
@@ -1258,6 +1276,7 @@ fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.To
         const loc = self.tree.tokenLocation(0, name_token);
         self.report(loc, .Z007, import_path);
     } else {
+        // ziglint-ignore: Z026
         self.seen_imports.put(self.allocator, import_path, name_token) catch {};
     }
 }
@@ -1309,6 +1328,53 @@ fn checkCatchReturnAll(self: *Linter) void {
 
         const loc = self.tree.tokenLocation(0, catch_token);
         self.report(loc, .Z025, payload_name);
+    }
+}
+
+fn checkEmptyCatchAll(self: *Linter) void {
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (self.tree.nodeTag(node) != .@"catch") continue;
+
+        const data = self.tree.nodeData(node).node_and_node;
+        const rhs = data[1];
+
+        if (!self.isEmptyBlock(rhs)) continue;
+
+        // Skip if under a defer node
+        if (self.isUnderDefer(node)) continue;
+
+        const catch_token = self.tree.nodeMainToken(node);
+        const loc = self.tree.tokenLocation(0, catch_token);
+        self.report(loc, .Z026, "");
+    }
+}
+
+fn isEmptyBlock(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+    return switch (tag) {
+        .block_two, .block_two_semicolon => {
+            const block_data = self.tree.nodeData(node).opt_node_and_opt_node;
+            return block_data[0] == .none and block_data[1] == .none;
+        },
+        .block, .block_semicolon => {
+            var buf: [2]Ast.Node.Index = undefined;
+            const stmts = self.tree.blockStatements(&buf, node) orelse return true;
+            return stmts.len == 0;
+        },
+        else => false,
+    };
+}
+
+fn isUnderDefer(self: *Linter, node: Ast.Node.Index) bool {
+    if (self.parent_map.len == 0) return false;
+    var current = node;
+    while (true) {
+        const parent_opt = self.parent_map[@intFromEnum(current)];
+        const parent = parent_opt.unwrap() orelse return false;
+        const tag = self.tree.nodeTag(parent);
+        if (tag == .@"defer" or tag == .@"errdefer") return true;
+        current = parent;
     }
 }
 
@@ -1726,6 +1792,7 @@ fn reportLineLength(self: *Linter, line: usize, context: []const u8, max_len: u3
         .column = @intCast(max_len + 1),
         .rule = .Z024,
         .context = context,
+        // ziglint-ignore: Z026
     }) catch {};
 }
 
@@ -1738,6 +1805,7 @@ fn report(self: *Linter, loc: Ast.Location, rule: rules.Rule, context: []const u
         .column = @intCast(loc.column + 1),
         .rule = rule,
         .context = context,
+        // ziglint-ignore: Z026
     }) catch {};
 }
 
@@ -3248,6 +3316,83 @@ test "Z025: allow catch returning different value" {
     linter.lint();
     for (linter.diagnostics.items) |d| {
         if (d.rule == rules.Rule.Z025) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z026: detect empty catch block" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z026: detect empty catch with payload" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch |_| {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z026: allow catch in defer" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    defer writer.flush() catch {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z026: allow catch in errdefer" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    errdefer writer.flush() catch {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z026: allow non-empty catch" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch |err| {
+        \\        log.err("{}", .{err});
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) {
             try std.testing.expect(false);
         }
     }

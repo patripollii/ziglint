@@ -48,6 +48,7 @@ pub fn deinit(self: *ModuleGraph) void {
 }
 
 pub fn addModulePublic(self: *ModuleGraph, path: []const u8) void {
+    // ziglint-ignore: Z026
     self.addModule(path) catch {};
 }
 
