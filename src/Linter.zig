@@ -3660,6 +3660,40 @@ test "Z025: allow catch returning different value" {
     }
 }
 
+test "Z025: detect catch return in assignment context" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    const x = bar() catch |err| return err;
+        \\    return x;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z025));
+}
+
+test "Z025: allow catch with discard payload" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch |_| return error.Other;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z025));
+}
+
+test "Z025: no false positive on clean code" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return try bar();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z025));
+}
+
 test "Z026: detect empty catch block" {
     var linter: Linter = .init(std.testing.allocator,
         \\fn foo() void {
@@ -3735,6 +3769,55 @@ test "Z026: allow non-empty catch" {
             try std.testing.expect(false);
         }
     }
+}
+
+test "Z026: allow catch with @panic" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch |err| {
+        \\        @panic("unexpected");
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z026));
+}
+
+test "Z026: allow catch with unreachable" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch |err| {
+        \\        unreachable;
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z026));
+}
+
+test "Z026: no false positive on clean code" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    try bar();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z026));
+}
+
+test "Z026: detect multiple empty catches" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    bar() catch {};
+        \\    baz() catch {};
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z026));
 }
 
 test "Z027: flag instance accessing const" {
