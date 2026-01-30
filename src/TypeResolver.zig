@@ -792,11 +792,92 @@ fn resolveBuiltinCall(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
 }
 
 fn resolveFunctionCall(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) TypeInfo {
-    _ = module_path;
-    _ = node;
-    _ = tree;
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buf, node) orelse return .unknown;
+    const fn_expr = call.ast.fn_expr;
+
+    const fn_expr_tag = tree.nodeTag(fn_expr);
+    switch (fn_expr_tag) {
+        .identifier => {
+            const fn_name = tree.tokenSlice(tree.nodeMainToken(fn_expr));
+            return self.resolveCallByName(tree, fn_name, module_path);
+        },
+        .field_access => {
+            return self.resolveMethodCall(tree, fn_expr, module_path);
+        },
+        else => {},
+    }
+
+    return .unknown;
+}
+
+fn resolveCallByName(self: *TypeResolver, tree: *const Ast, fn_name: []const u8, module_path: []const u8) TypeInfo {
+    for (tree.rootDecls()) |decl_node| {
+        if (tree.nodeTag(decl_node) != .fn_decl) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const fn_proto = tree.fullFnProto(&buf, decl_node) orelse continue;
+        const name_token = fn_proto.name_token orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(name_token), fn_name)) continue;
+        return self.resolveReturnType(tree, fn_proto, module_path);
+    }
+    return .unknown;
+}
+
+fn resolveMethodCall(self: *TypeResolver, tree: *const Ast, fn_expr: Ast.Node.Index, module_path: []const u8) TypeInfo {
+    const data = tree.nodeData(fn_expr).node_and_token;
+    const lhs_node = data[0];
+    const method_name = tree.tokenSlice(data[1]);
+    const lhs_type = self.resolveNodeType(tree, lhs_node, module_path);
+
+    switch (lhs_type) {
+        .user_type => |u| {
+            const mod = self.graph.getModule(u.module_path) orelse return .unknown;
+            const mod_tree = &mod.tree;
+            const fn_node = self.findFnInType(mod_tree, u.name, method_name) orelse
+                return .unknown;
+            var buf: [1]Ast.Node.Index = undefined;
+            const fn_proto = mod_tree.fullFnProto(&buf, fn_node) orelse return .unknown;
+            return self.resolveReturnType(mod_tree, fn_proto, u.module_path);
+        },
+        else => {},
+    }
+
+    return .unknown;
+}
+
+fn findFnInType(self: *TypeResolver, tree: *const Ast, type_name: []const u8, fn_name: []const u8) ?Ast.Node.Index {
     _ = self;
-    return .{ .function = .{ .return_type = null } };
+    for (tree.rootDecls()) |decl_node| {
+        const decl_tag = tree.nodeTag(decl_node);
+        switch (decl_tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = tree.fullVarDecl(decl_node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                if (!std.mem.eql(u8, tree.tokenSlice(name_token), type_name)) continue;
+                const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+                if (!isContainerDecl(tree.nodeTag(init_node))) continue;
+
+                var members_buf: [2]Ast.Node.Index = undefined;
+                const container = tree.fullContainerDecl(&members_buf, init_node) orelse continue;
+                for (container.ast.members) |member| {
+                    if (tree.nodeTag(member) != .fn_decl) continue;
+                    var fn_buf: [1]Ast.Node.Index = undefined;
+                    const fn_proto = tree.fullFnProto(&fn_buf, member) orelse continue;
+                    const fn_name_token = fn_proto.name_token orelse continue;
+                    if (std.mem.eql(u8, tree.tokenSlice(fn_name_token), fn_name)) {
+                        return member;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn resolveReturnType(self: *TypeResolver, tree: *const Ast, fn_proto: std.zig.Ast.full.FnProto, module_path: []const u8) TypeInfo {
+    const ret_node = fn_proto.ast.return_type.unwrap() orelse return .unknown;
+    return self.resolveNodeType(tree, ret_node, module_path);
 }
 
 fn resolvePtrType(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index) TypeInfo {
@@ -1217,4 +1298,138 @@ test "find method in std_type without zig_lib_path returns null" {
     const method_def = resolver.findMethodDef(std_type, "read");
 
     try std.testing.expect(method_def == null);
+}
+
+test "resolve function call return type" {
+    const source =
+        \\fn getCount() u32 {
+        \\    return 42;
+        \\}
+        \\const x = getCount();
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    const type_info = resolver.typeOf(path, root_decls[1]);
+    try std.testing.expect(type_info == .primitive);
+    try std.testing.expectEqual(TypeInfo.Primitive.u32, type_info.primitive);
+}
+
+test "resolve function call returning bool" {
+    const source =
+        \\fn isValid() bool {
+        \\    return true;
+        \\}
+        \\const x = isValid();
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    const type_info = resolver.typeOf(path, root_decls[1]);
+    try std.testing.expect(type_info == .primitive);
+    try std.testing.expectEqual(TypeInfo.Primitive.bool, type_info.primitive);
+}
+
+test "resolve method call return type" {
+    const source =
+        \\const MyType = struct {
+        \\    value: u32,
+        \\    pub fn getValue(self: *@This()) u32 {
+        \\        return self.value;
+        \\    }
+        \\};
+        \\const obj: MyType = undefined;
+        \\const x = obj.getValue();
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    const type_info = resolver.typeOf(path, root_decls[2]);
+    try std.testing.expect(type_info == .primitive);
+    try std.testing.expectEqual(TypeInfo.Primitive.u32, type_info.primitive);
+}
+
+test "resolve type-returning function call" {
+    const source =
+        \\fn MyType() type {
+        \\    return struct {};
+        \\}
+        \\const T = MyType();
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    const type_info = resolver.typeOf(path, root_decls[1]);
+    try std.testing.expect(type_info == .type_type);
+}
+
+test "resolve unknown function call" {
+    const source =
+        \\const x = unknownFn();
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    const type_info = resolver.typeOf(path, root_decls[0]);
+    try std.testing.expect(type_info == .unknown);
 }
