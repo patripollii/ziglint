@@ -29,7 +29,6 @@ pub const Rule = enum(u16) {
     Z025 = 25,
     Z026 = 26,
     Z027 = 27,
-    Z028 = 28,
     Z029 = 29,
 
     /// Returns the config struct type for this rule.
@@ -201,7 +200,6 @@ pub const Rule = enum(u16) {
                     y, field, r, m, type_name, r,
                 });
             },
-            .Z028 => try writer.print("unused declaration {s}'{s}'{s}", .{ y, context, r }),
             .Z029 => {
                 try writer.print("redundant {s}@as{s}{s}({s}{s}{s}{s}, ...){s}: type {s}{s}{s} already known from context", .{
                     b, r, d, r, m, context, d, r, m, context, r,
