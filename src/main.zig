@@ -34,6 +34,7 @@ pub fn main() !u8 {
     defer stderr.end() catch {};
 
     var config = parseArgs(allocator, &stderr.interface) catch |err| switch (err) {
+        error.HelpOrVersion => return 0,
         error.InvalidArgs => return 1,
         else => return err,
     };
@@ -139,10 +140,10 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
             }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printUsage(writer);
-            return error.InvalidArgs;
+            return error.HelpOrVersion;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             try printVersion(writer);
-            return error.InvalidArgs;
+            return error.HelpOrVersion;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             try writer.print("error: unknown option '{s}'\n", .{arg});
             return error.InvalidArgs;
