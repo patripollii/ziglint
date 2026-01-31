@@ -193,10 +193,6 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
         }
         file_count += 1;
     }
-
-    if (file_count > 0) {
-        std.debug.print("doc tests: {d} examples from {d} files passed\n", .{ test_count, file_count });
-    }
 }
 
 test "doc tests" {
