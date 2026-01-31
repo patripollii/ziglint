@@ -29,6 +29,7 @@ pub const Rule = enum(u16) {
     Z025 = 25,
     Z026 = 26,
     Z027 = 27,
+    Z028 = 28,
     Z029 = 29,
 
     /// Returns the config struct type for this rule.
@@ -199,6 +200,9 @@ pub const Rule = enum(u16) {
                 try writer.print("access {s}'{s}'{s} through type {s}'{s}'{s} instead of instance", .{
                     y, field, r, m, type_name, r,
                 });
+            },
+            .Z028 => {
+                try writer.print("inline {s}@import{s}; assign to a top-level {s}const{s}", .{ b, r, p, r });
             },
             .Z029 => {
                 try writer.print("redundant {s}@as{s}{s}({s}{s}{s}{s}, ...){s}: type {s}{s}{s} already known from context", .{

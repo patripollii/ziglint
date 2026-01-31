@@ -143,6 +143,7 @@ pub fn lint(self: *Linter) void {
 
     self.checkUnusedImports();
     self.checkThisBuiltin();
+    self.checkInlineImports();
     self.checkCatchReturnAll();
     self.checkEmptyCatchAll();
     self.checkInstanceDeclAccess();
@@ -373,6 +374,19 @@ fn getNodeChildren(self: *Linter, node: Ast.Node.Index) ChildList {
             children.append(data[1]);
         },
 
+        // field_access: node_and_token = [lhs, field_token]
+        .field_access => {
+            const data = self.tree.nodeData(node).node_and_token;
+            children.append(data[0]);
+        },
+
+        // assign: node_and_node = [lhs, rhs]
+        .assign => {
+            const data = self.tree.nodeData(node).node_and_node;
+            children.append(data[0]);
+            children.append(data[1]);
+        },
+
         else => {},
     }
 
@@ -461,6 +475,87 @@ fn checkThisBuiltin(self: *Linter) void {
     }
 }
 
+fn checkInlineImports(self: *Linter) void {
+    if (!self.config.isRuleEnabled(.Z028)) return;
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const tag = self.tree.nodeTag(node);
+
+        // Look for @import() calls
+        if (tag != .builtin_call_two and tag != .builtin_call_two_comma) continue;
+        const main_token = self.tree.nodeMainToken(node);
+        const builtin_name = self.tree.tokenSlice(main_token);
+        if (!std.mem.eql(u8, builtin_name, "@import")) continue;
+
+        // Walk up through field_access chain to find var decl
+        // e.g., `const Rule = @import("rules.zig").Rule;`
+        var current = node;
+        while (true) {
+            const parent = self.parent_map[@intFromEnum(current)].unwrap() orelse {
+                const loc = self.tree.tokenLocation(0, main_token);
+                self.report(loc, .Z028, "");
+                break;
+            };
+
+            const parent_tag = self.tree.nodeTag(parent);
+            switch (parent_tag) {
+                .field_access => {
+                    // Continue walking up through field access chain
+                    current = parent;
+                    continue;
+                },
+                .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                    const var_decl = self.tree.fullVarDecl(parent) orelse {
+                        const loc = self.tree.tokenLocation(0, main_token);
+                        self.report(loc, .Z028, "");
+                        break;
+                    };
+                    const mut_token = self.tree.tokenSlice(var_decl.ast.mut_token);
+                    const init_node = var_decl.ast.init_node.unwrap() orelse {
+                        const loc = self.tree.tokenLocation(0, main_token);
+                        self.report(loc, .Z028, "");
+                        break;
+                    };
+                    // Must be `const` and the init must be our current node (or an ancestor)
+                    if (!std.mem.eql(u8, mut_token, "const") or init_node != current) {
+                        const loc = self.tree.tokenLocation(0, main_token);
+                        self.report(loc, .Z028, "");
+                        break;
+                    }
+                    // Check that the var decl is at file level (not inside a function)
+                    // Allow imports in test blocks
+                    if (!self.isAtFileLevel(parent) and !self.isInTestBlock(parent)) {
+                        const loc = self.tree.tokenLocation(0, main_token);
+                        self.report(loc, .Z028, "");
+                    }
+                    break;
+                },
+                .assign => {
+                    // Allow `_ = @import(...)` pattern for pulling in tests
+                    const data = self.tree.nodeData(parent).node_and_node;
+                    const lhs = data[0];
+                    if (self.tree.nodeTag(lhs) == .identifier) {
+                        const lhs_name = self.tree.tokenSlice(self.tree.nodeMainToken(lhs));
+                        if (std.mem.eql(u8, lhs_name, "_")) {
+                            // Discarding import is allowed
+                            break;
+                        }
+                    }
+                    const loc = self.tree.tokenLocation(0, main_token);
+                    self.report(loc, .Z028, "");
+                    break;
+                },
+                else => {
+                    const loc = self.tree.tokenLocation(0, main_token);
+                    self.report(loc, .Z028, "");
+                    break;
+                },
+            }
+        }
+    }
+}
+
 fn hasTopLevelFields(self: *Linter) bool {
     for (self.tree.rootDecls()) |node| {
         const tag = self.tree.nodeTag(node);
@@ -498,6 +593,21 @@ fn isAtFileLevel(self: *Linter, start_node: Ast.Node.Index) bool {
             => return false,
             else => {},
         }
+
+        current = parent;
+    }
+}
+
+fn isInTestBlock(self: *Linter, start_node: Ast.Node.Index) bool {
+    var current = start_node;
+
+    while (true) {
+        const parent_opt = self.parent_map[@intFromEnum(current)];
+        const parent = parent_opt.unwrap() orelse return false;
+        const parent_tag = self.tree.nodeTag(parent);
+
+        if (parent_tag == .test_decl) return true;
+        if (parent_tag == .fn_decl) return false; // Functions block test scope
 
         current = parent;
     }
@@ -3650,7 +3760,8 @@ test "Z023: argument order - aliased Allocator" {
     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
     defer std.testing.allocator.free(path);
 
-    var graph = try @import("ModuleGraph.zig").init(std.testing.allocator, path, null);
+    const ModuleGraph = @import("ModuleGraph.zig");
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3683,7 +3794,8 @@ test "Z023: argument order - aliased Io" {
     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
     defer std.testing.allocator.free(path);
 
-    var graph = try @import("ModuleGraph.zig").init(std.testing.allocator, path, null);
+    const ModuleGraph = @import("ModuleGraph.zig");
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3750,7 +3862,8 @@ test "Z023: receiver param with struct name is ok (semantic)" {
     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
     defer std.testing.allocator.free(path);
 
-    var graph = try @import("ModuleGraph.zig").init(std.testing.allocator, path, null);
+    const ModuleGraph = @import("ModuleGraph.zig");
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -3781,7 +3894,8 @@ test "Z023: file-as-struct receiver is ok (semantic)" {
     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "Terminal.zig");
     defer std.testing.allocator.free(path);
 
-    var graph = try @import("ModuleGraph.zig").init(std.testing.allocator, path, null);
+    const ModuleGraph = @import("ModuleGraph.zig");
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -4705,4 +4819,86 @@ test "Z029: mixed match and mismatch in call args" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z028: inline import in switch" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const builtin = @import("builtin");
+        \\const Backend = switch (builtin.os.tag) {
+        \\    .linux => @import("linux.zig"),
+        \\    .macos => @import("macos.zig"),
+        \\    else => @compileError("unsupported"),
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: inline import in function call" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(x: anytype) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@import("bar.zig").baz);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow top-level const import" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const other = @import("other.zig");
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: disallow import inside function" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const std = @import("std");
+        \\    _ = std;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow discard import for pulling in tests" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\test {
+        \\    _ = @import("other.zig");
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow const import in test block" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\test "example" {
+        \\    const testing = @import("testing.zig");
+        \\    testing.check();
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow field access on import" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Rule = @import("rules.zig").Rule;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
 }

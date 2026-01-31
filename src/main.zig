@@ -1,6 +1,7 @@
 //! ziglint - A linter for Zig source code
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const version = build_options.version;
 
@@ -65,7 +66,7 @@ pub fn main() !u8 {
 }
 
 fn detectColorSupport(file: std.fs.File) bool {
-    const native = @import("builtin").os.tag;
+    const native = builtin.os.tag;
     // NO_COLOR takes precedence (https://no-color.org/)
     if (native == .windows) {
         if (std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("NO_COLOR"))) |_| return false;

@@ -48,6 +48,7 @@ Directories are scanned recursively for `.zig` files.
 | Z025 | Redundant `catch |err| return err`; use `try` instead |
 | Z026 | Empty `catch` block suppresses errors |
 | Z027 | Access declaration through type instead of instance |
+| Z028 | Inline `@import`; assign to a top-level `const` |
 | Z029 | Redundant `@as` cast; type already known from context |
 
 ## Configuration
