@@ -388,6 +388,21 @@ fn getNodeChildren(self: *Linter, node: Ast.Node.Index) ChildList {
             children.append(data[1]);
         },
 
+        // call_one: node_and_opt_node = [callee, arg]
+        .call_one, .call_one_comma => {
+            const data = self.tree.nodeData(node).node_and_opt_node;
+            children.append(data[0]);
+            if (data[1].unwrap()) |arg| children.append(arg);
+        },
+
+        // call: sub_range = [callee, args...]
+        .call, .call_comma => {
+            var buf: [1]Ast.Node.Index = undefined;
+            const full_call = self.tree.fullCall(&buf, node) orelse return children;
+            children.append(full_call.ast.fn_expr);
+            for (full_call.ast.params) |param| children.append(param);
+        },
+
         else => {},
     }
 
@@ -416,6 +431,14 @@ fn checkThisBuiltin(self: *Linter) void {
         };
 
         const parent_tag = self.tree.nodeTag(parent);
+
+        // Allow @This() as a function argument (e.g., testing.refAllDecls(@This()))
+        if (parent_tag == .call_one or parent_tag == .call_one_comma or
+            parent_tag == .call or parent_tag == .call_comma)
+        {
+            continue;
+        }
+
         const const_decl_info: ?struct { name: []const u8 } = switch (parent_tag) {
             .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => blk: {
                 const var_decl = self.tree.fullVarDecl(parent) orelse break :blk null;
@@ -3879,6 +3902,20 @@ test "Z020: inline @This() should warn" {
         if (d.rule == rules.Rule.Z020) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "Z020: @This() as function argument is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\test {
+        \\    std.testing.refAllDecls(@This());
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z020);
+    }
 }
 
 test "Z021: file-struct @This() alias should match filename or Self" {
