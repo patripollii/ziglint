@@ -201,6 +201,9 @@ fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]co
 
 fn lintPath(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     const stat = std.fs.cwd().statFile(path) catch |err| {
+        if (err == error.IsDir) {
+            return lintDirectory(allocator, path, zig_lib_path, config, use_color, project_root, writer);
+        }
         try writer.print("error: cannot access '{s}': {}\n", .{ path, err });
         return 0;
     };
