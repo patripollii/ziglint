@@ -125,6 +125,7 @@ pub fn deinit(self: *Linter) void {
     if (self.parent_map.len > 0) {
         self.allocator.free(self.parent_map);
     }
+    self.* = undefined;
 }
 
 pub fn lint(self: *Linter) void {
@@ -1320,6 +1321,136 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
 
     self.checkExposedPrivateType(node);
     self.checkArgumentOrder(node);
+    self.checkDeinitUndefined(node, fn_proto);
+}
+
+fn checkDeinitUndefined(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.FnProto) void {
+    if (!self.config.isRuleEnabled(.Z030)) return;
+
+    // Only check functions named "deinit"
+    const name_token = fn_proto.name_token orelse return;
+    const name = self.tree.tokenSlice(name_token);
+    if (!std.mem.eql(u8, name, "deinit")) return;
+
+    // Check if first parameter is a pointer type
+    var param_it = fn_proto.iterate(&self.tree);
+    const first_param = param_it.next() orelse return;
+    const param_type = first_param.type_expr orelse return;
+    if (!self.isPointerType(param_type)) return;
+
+    // Get the parameter name (usually "self")
+    const param_name = if (first_param.name_token) |t| self.tree.tokenSlice(t) else return;
+
+    // Get function body
+    const body_node = self.tree.nodeData(node).node_and_node[1];
+
+    // Check for `defer self.* = undefined;` anywhere in body - this handles all paths
+    if (self.hasDeferSelfUndefined(body_node, param_name)) return;
+
+    // Check for early returns (which would skip final self.* = undefined)
+    if (self.hasEarlyReturn(body_node)) {
+        const loc = self.tree.tokenLocation(0, name_token);
+        self.report(loc, .Z030, "has early return without defer");
+        return;
+    }
+
+    // Check if last statement is `self.* = undefined;`
+    if (self.lastStatementIsSelfUndefined(body_node, param_name)) return;
+
+    // None of the valid patterns found
+    const loc = self.tree.tokenLocation(0, name_token);
+    self.report(loc, .Z030, "");
+}
+
+fn isPointerType(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+    return switch (tag) {
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => true,
+        else => false,
+    };
+}
+
+fn hasDeferSelfUndefined(self: *Linter, body_node: Ast.Node.Index, param_name: []const u8) bool {
+    // Iterate through all nodes looking for defer
+    var buf: [2]Ast.Node.Index = undefined;
+    const stmts = self.tree.blockStatements(&buf, body_node) orelse return false;
+
+    for (stmts) |stmt| {
+        if (self.tree.nodeTag(stmt) == .@"defer") {
+            const defer_expr = self.tree.nodeData(stmt).node;
+            if (self.isSelfUndefinedAssign(defer_expr, param_name)) return true;
+        }
+    }
+    return false;
+}
+
+fn hasEarlyReturn(self: *Linter, body_node: Ast.Node.Index) bool {
+    var buf: [2]Ast.Node.Index = undefined;
+    const stmts = self.tree.blockStatements(&buf, body_node) orelse return false;
+
+    // Check all statements except the last one for returns
+    if (stmts.len <= 1) return false;
+
+    for (stmts[0 .. stmts.len - 1]) |stmt| {
+        if (self.containsReturn(stmt)) return true;
+    }
+    return false;
+}
+
+fn containsReturn(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+    if (tag == .@"return") return true;
+
+    // Recursively check children for returns (e.g., in if blocks)
+    switch (tag) {
+        .@"if", .if_simple => {
+            const full_if = self.tree.fullIf(node) orelse return false;
+            if (self.containsReturn(full_if.ast.then_expr)) return true;
+            if (full_if.ast.else_expr.unwrap()) |else_node| {
+                if (self.containsReturn(else_node)) return true;
+            }
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            var block_buf: [2]Ast.Node.Index = undefined;
+            const block_stmts = self.tree.blockStatements(&block_buf, node) orelse return false;
+            for (block_stmts) |stmt| {
+                if (self.containsReturn(stmt)) return true;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn lastStatementIsSelfUndefined(self: *Linter, body_node: Ast.Node.Index, param_name: []const u8) bool {
+    var buf: [2]Ast.Node.Index = undefined;
+    const stmts = self.tree.blockStatements(&buf, body_node) orelse return false;
+    if (stmts.len == 0) return false;
+
+    const last_stmt = stmts[stmts.len - 1];
+    return self.isSelfUndefinedAssign(last_stmt, param_name);
+}
+
+fn isSelfUndefinedAssign(self: *Linter, node: Ast.Node.Index, param_name: []const u8) bool {
+    if (self.tree.nodeTag(node) != .assign) return false;
+
+    const assign_data = self.tree.nodeData(node).node_and_node;
+    const lhs = assign_data[0];
+    const rhs = assign_data[1];
+
+    // LHS must be deref (self.*)
+    if (self.tree.nodeTag(lhs) != .deref) return false;
+
+    // The dereferenced expression must be the parameter name
+    const deref_inner = self.tree.nodeData(lhs).node;
+    if (self.tree.nodeTag(deref_inner) != .identifier) return false;
+    const deref_name = self.tree.tokenSlice(self.tree.nodeMainToken(deref_inner));
+    if (!std.mem.eql(u8, deref_name, param_name)) return false;
+
+    // RHS must be undefined
+    if (self.tree.nodeTag(rhs) != .identifier) return false;
+    const rhs_name = self.tree.tokenSlice(self.tree.nodeMainToken(rhs));
+    return std.mem.eql(u8, rhs_name, "undefined");
 }
 
 fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
@@ -4945,4 +5076,121 @@ test "Z028: allow field access on import" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z030: detect missing self.* = undefined in deinit" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow deinit with self.* = undefined at end" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        self.a = 0;
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow deinit with defer self.* = undefined" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        defer self.* = undefined;
+        \\        cleanup();
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: detect early return without defer" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        if (self.a == 0) return;
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow early return with defer" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: *Foo) void {
+        \\        defer self.* = undefined;
+        \\        if (self.a == 0) return;
+        \\        cleanup();
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: skip non-pointer receiver deinit" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(self: Foo) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: skip non-deinit functions" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn close(self: *Foo) void {
+        \\        _ = self;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: handle different self parameter names" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    a: u32,
+        \\    fn deinit(s: *Foo) void {
+        \\        s.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
 }

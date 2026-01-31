@@ -45,6 +45,7 @@ pub fn deinit(self: *ModuleGraph) void {
         self.allocator.free(mod.path);
     }
     self.modules.deinit(self.allocator);
+    self.* = undefined;
 }
 
 pub fn addModulePublic(self: *ModuleGraph, path: []const u8) void {

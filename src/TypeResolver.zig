@@ -165,7 +165,7 @@ pub const MethodDef = struct {
 };
 
 pub fn deinit(self: *TypeResolver) void {
-    _ = self;
+    self.* = undefined;
 }
 
 /// Resolves the type of an AST node within a module.

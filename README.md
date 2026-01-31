@@ -50,6 +50,7 @@ Directories are scanned recursively for `.zig` files.
 | Z027 | Access declaration through type instead of instance |
 | Z028 | Inline `@import`; assign to a top-level `const` |
 | Z029 | Redundant `@as` cast; type already known from context |
+| Z030 | `deinit` should set `self.* = undefined` |
 
 ## Configuration
 
