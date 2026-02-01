@@ -1415,6 +1415,46 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
         }
     }
 
+    // Check for underscore prefix
+    if (self.config.isRuleEnabled(.Z031) and hasUnderscorePrefix(name)) {
+        const loc = self.tree.tokenLocation(0, name_token);
+        self.report(loc, .Z031, name);
+    }
+
+    // Check for acronym casing
+    // Check for acronym casing
+    if (self.config.isRuleEnabled(.Z032)) {
+        if (checkAcronymCasing(self.allocator, name)) |suggestion| {
+            const context = self.allocator.alloc(u8, name.len + 1 + suggestion.len) catch {
+                self.allocator.free(suggestion);
+                return;
+            };
+            @memcpy(context[0..name.len], name);
+            context[name.len] = 0;
+            @memcpy(context[name.len + 1 ..], suggestion);
+            // ziglint-ignore: Z026
+            self.allocated_contexts.append(self.allocator, context) catch {};
+            // ziglint-ignore: Z026
+            self.allocated_contexts.append(self.allocator, suggestion) catch {};
+            const loc = self.tree.tokenLocation(0, name_token);
+            self.report(loc, .Z032, context);
+        }
+    }
+
+    // Check for redundant words (disabled by default)
+    if (self.config.isRuleEnabled(.Z033)) {
+        if (findRedundantWord(name)) |word| {
+            const context = self.allocator.alloc(u8, name.len + 1 + word.len) catch return;
+            @memcpy(context[0..name.len], name);
+            context[name.len] = 0;
+            @memcpy(context[name.len + 1 ..], word);
+            // ziglint-ignore: Z026
+            self.allocated_contexts.append(self.allocator, context) catch {};
+            const loc = self.tree.tokenLocation(0, name_token);
+            self.report(loc, .Z033, context);
+        }
+    }
+
     self.checkExposedPrivateType(node);
     self.checkArgumentOrder(node);
     self.checkDeinitUndefined(node, fn_proto);
@@ -1567,6 +1607,12 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
         self.report(loc, .Z006, name);
     }
 
+    // Check for underscore prefix
+    if (self.config.isRuleEnabled(.Z031) and hasUnderscorePrefix(name)) {
+        const loc = self.tree.tokenLocation(0, name_token);
+        self.report(loc, .Z031, name);
+    }
+
     // Check that error sets are PascalCase
     if (var_decl.ast.init_node.unwrap()) |init_node| {
         if (self.tree.nodeTag(init_node) == .error_set_decl and !isPascalCase(name)) {
@@ -1581,6 +1627,39 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
                 const loc = self.tree.tokenLocation(0, var_decl.ast.mut_token);
                 self.report(loc, .Z004, name);
             }
+        }
+    }
+
+    // Check for acronym casing (for type aliases)
+    if (self.config.isRuleEnabled(.Z032) and isTypeAlias(self, var_decl)) {
+        if (checkAcronymCasing(self.allocator, name)) |suggestion| {
+            const context = self.allocator.alloc(u8, name.len + 1 + suggestion.len) catch {
+                self.allocator.free(suggestion);
+                return;
+            };
+            @memcpy(context[0..name.len], name);
+            context[name.len] = 0;
+            @memcpy(context[name.len + 1 ..], suggestion);
+            // ziglint-ignore: Z026
+            self.allocated_contexts.append(self.allocator, context) catch {};
+            // ziglint-ignore: Z026
+            self.allocated_contexts.append(self.allocator, suggestion) catch {};
+            const loc = self.tree.tokenLocation(0, name_token);
+            self.report(loc, .Z032, context);
+        }
+    }
+
+    // Check for redundant words (disabled by default)
+    if (self.config.isRuleEnabled(.Z033) and isTypeAlias(self, var_decl)) {
+        if (findRedundantWord(name)) |word| {
+            const context = self.allocator.alloc(u8, name.len + 1 + word.len) catch return;
+            @memcpy(context[0..name.len], name);
+            context[name.len] = 0;
+            @memcpy(context[name.len + 1 ..], word);
+            // ziglint-ignore: Z026
+            self.allocated_contexts.append(self.allocator, context) catch {};
+            const loc = self.tree.tokenLocation(0, name_token);
+            self.report(loc, .Z033, context);
         }
     }
 
@@ -2241,6 +2320,152 @@ fn isSnakeCase(name: []const u8) bool {
         if (c >= 'A' and c <= 'Z') return false;
     }
     return true;
+}
+
+/// Returns true if the identifier has an underscore prefix (but not just `_` or `__`).
+fn hasUnderscorePrefix(name: []const u8) bool {
+    if (name.len < 2) return false;
+    if (name[0] != '_') return false;
+    // Allow `__` double-underscore prefix (e.g., `__builtin`)
+    if (name[1] == '_') return false;
+    return true;
+}
+
+/// Checks if a name has incorrect acronym casing (e.g., XMLParser instead of XmlParser).
+/// Returns the suggested fix if there's an issue, null otherwise.
+fn checkAcronymCasing(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    if (name.len < 2) return null;
+
+    // Find sequences of 2+ uppercase letters that should be title-cased
+    // XMLParser -> XmlParser (XML at start)
+    // readXML -> readXml (XML at end)
+    // HTTPSConnection -> HttpsConnection (HTTPS at start)
+    // getHTTPSConnection -> getHttpsConnection (HTTPS in middle)
+
+    var result = allocator.alloc(u8, name.len) catch return null;
+    @memcpy(result, name);
+    var has_issue = false;
+
+    var i: usize = 0;
+    while (i < name.len) {
+        if (isUppercase(name[i])) {
+            // Found start of potential acronym
+            const start = i;
+            var end = i + 1;
+            while (end < name.len and isUppercase(name[end])) {
+                end += 1;
+            }
+
+            const acronym_len = end - start;
+            if (acronym_len >= 2) {
+                // We have 2+ consecutive uppercase letters
+                // Check if this is at the end or followed by lowercase
+                if (end < name.len and isLowercase(name[end])) {
+                    // e.g., "XMLParser" - the last letter of "XML" is part of "Parser"
+                    // Convert all but last uppercase to lowercase: "XmlParser"
+                    for (start + 1..end - 1) |j| {
+                        result[j] = toLowercase(name[j]);
+                    }
+                    if (acronym_len > 2) has_issue = true;
+                } else {
+                    // At end or followed by non-alpha (e.g., "readXML" or "XML123")
+                    // Convert all but first to lowercase: "readXml" or "Xml123"
+                    for (start + 1..end) |j| {
+                        result[j] = toLowercase(name[j]);
+                    }
+                    if (acronym_len >= 2) has_issue = true;
+                }
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+
+    if (has_issue) {
+        return result;
+    } else {
+        allocator.free(result);
+        return null;
+    }
+}
+
+fn isUppercase(c: u8) bool {
+    return c >= 'A' and c <= 'Z';
+}
+
+fn isLowercase(c: u8) bool {
+    return c >= 'a' and c <= 'z';
+}
+
+fn toLowercase(c: u8) u8 {
+    if (c >= 'A' and c <= 'Z') return c + 32;
+    return c;
+}
+
+/// Words that are considered redundant in identifier names per the Zig style guide.
+const redundant_words = [_][]const u8{
+    "Value",
+    "Data",
+    "Context",
+    "Manager",
+    "State",
+    "utils",
+    "misc",
+    "Util",
+    "Utils",
+    "Misc",
+};
+
+/// Checks if a name contains a redundant word and returns it if found.
+fn findRedundantWord(name: []const u8) ?[]const u8 {
+    // Check if the name contains any redundant word as a complete word boundary
+    for (redundant_words) |word| {
+        if (containsWordBoundary(name, word)) {
+            return word;
+        }
+    }
+    return null;
+}
+
+/// Returns true if name contains word at a word boundary (start, end, or camelCase boundary).
+fn containsWordBoundary(name: []const u8, word: []const u8) bool {
+    if (word.len > name.len) return false;
+
+    // Check if name equals word exactly
+    if (std.mem.eql(u8, name, word)) return true;
+
+    // Check if name starts with word followed by uppercase or end
+    if (std.mem.startsWith(u8, name, word)) {
+        if (word.len == name.len) return true;
+        const next = name[word.len];
+        // Word boundary: followed by uppercase (camelCase) or non-alpha
+        if (isUppercase(next) or (!isLowercase(next) and !isUppercase(next))) return true;
+    }
+
+    // Check if name ends with word preceded by lowercase
+    if (std.mem.endsWith(u8, name, word) and name.len > word.len) {
+        const prev = name[name.len - word.len - 1];
+        if (isLowercase(prev)) return true;
+    }
+
+    // Check for word in middle with camelCase boundaries
+    var i: usize = 1;
+    while (i + word.len <= name.len) {
+        if (std.mem.startsWith(u8, name[i..], word)) {
+            const prev = name[i - 1];
+            // Must be preceded by lowercase (camelCase boundary)
+            if (isLowercase(prev)) {
+                if (i + word.len == name.len) return true;
+                const next = name[i + word.len];
+                // Must be followed by uppercase or non-alpha
+                if (isUppercase(next) or (!isLowercase(next) and !isUppercase(next))) return true;
+            }
+        }
+        i += 1;
+    }
+
+    return false;
 }
 
 /// Returns true if the identifier is a primitive type (e.g., i32, u8, f64, bool, etc.)
@@ -5331,4 +5556,128 @@ test "Z030: handle different self parameter names" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z031: detect underscore prefix in function" {
+    var linter: Linter = .init(std.testing.allocator, "fn _privateFunc() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z031));
+}
+
+test "Z031: detect underscore prefix in variable" {
+    var linter: Linter = .init(std.testing.allocator, "const _privateVar: u32 = undefined;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z031));
+}
+
+test "Z031: allow single underscore discard" {
+    var linter: Linter = .init(std.testing.allocator, "const _ = 42;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z031));
+}
+
+test "Z031: allow double underscore prefix" {
+    var linter: Linter = .init(std.testing.allocator, "const __builtin = 42;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z031));
+}
+
+test "Z031: allow normal names" {
+    var linter: Linter = .init(std.testing.allocator, "fn myFunc() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z031));
+}
+
+test "Z032: detect XMLParser" {
+    var linter: Linter = .init(std.testing.allocator, "const XMLParser = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: detect HTTPSConnection" {
+    var linter: Linter = .init(std.testing.allocator, "const HTTPSConnection = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: detect function with acronym" {
+    var linter: Linter = .init(std.testing.allocator, "fn parseXML() void {}", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: allow XmlParser" {
+    var linter: Linter = .init(std.testing.allocator, "const XmlParser = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: allow two-letter at start" {
+    var linter: Linter = .init(std.testing.allocator, "const IoError = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z032));
+}
+
+test "Z032: detect IOError" {
+    var linter: Linter = .init(std.testing.allocator, "const IOError = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z032));
+}
+
+test "Z033: disabled by default" {
+    var linter: Linter = .init(std.testing.allocator, "const DataManager = struct {};", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: detect Data when enabled" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: Linter = .init(std.testing.allocator, "const UserData = struct {};", "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: detect Manager when enabled" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: Linter = .init(std.testing.allocator, "const StateManager = struct {};", "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: detect Context when enabled" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: Linter = .init(std.testing.allocator, "const AppContext = struct {};", "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: detect utils when enabled" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: Linter = .init(std.testing.allocator, "fn stringUtils() void {}", "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z033));
+}
+
+test "Z033: allow normal names when enabled" {
+    const config: Config = .{ .rules = .{ .Z033 = .{ .enabled = true } } };
+    var linter: Linter = .init(std.testing.allocator, "const Parser = struct {};", "test.zig", &config);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z033));
 }

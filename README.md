@@ -51,6 +51,9 @@ Directories are scanned recursively for `.zig` files.
 | Z028 | Inline `@import`; assign to a top-level `const` |
 | Z029 | Redundant `@as` cast; type already known from context |
 | Z030 | `deinit` should set `self.* = undefined` |
+| Z031 | Avoid underscore prefix in identifiers |
+| Z032 | Acronyms should use standard casing |
+| Z033 | Avoid redundant words in identifiers (disabled by default) |
 
 ## Configuration
 

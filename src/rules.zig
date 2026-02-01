@@ -32,14 +32,19 @@ pub const Rule = enum(u16) {
     Z028 = 28,
     Z029 = 29,
     Z030 = 30,
+    Z031 = 31,
+    Z032 = 32,
+    Z033 = 33,
 
     /// Returns the config struct type for this rule.
     /// All config types have `enabled: bool` (default varies per rule).
     /// Some rules have additional fields (e.g., Z024 has max_length).
     fn ConfigType(comptime self: Rule) type {
         const DefaultConfig = RuleConfig(true, struct {});
+        const DisabledConfig = RuleConfig(false, struct {});
         return switch (self) {
             .Z024 => RuleConfig(true, struct { max_length: u32 = 120 }),
+            .Z033 => DisabledConfig, // Redundant name words - disabled by default
             else => DefaultConfig,
         };
     }
@@ -216,6 +221,27 @@ pub const Rule = enum(u16) {
                 if (context.len > 0) {
                     try writer.print(" ({s})", .{context});
                 }
+            },
+            .Z031 => {
+                try writer.print("identifier {s}'{s}'{s} has underscore prefix; avoid {s}_like_this{s} naming", .{ y, context, r, y, r });
+            },
+            .Z032 => {
+                // context is "name\x00suggestion"
+                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const name = context[0..sep];
+                const suggestion = if (sep < context.len) context[sep + 1 ..] else "";
+                if (suggestion.len > 0) {
+                    try writer.print("acronym in {s}'{s}'{s} should use standard casing: {s}'{s}'{s}", .{ y, name, r, y, suggestion, r });
+                } else {
+                    try writer.print("acronym in {s}'{s}'{s} should use standard casing", .{ y, name, r });
+                }
+            },
+            .Z033 => {
+                // context is "name\x00word"
+                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const name = context[0..sep];
+                const word = if (sep < context.len) context[sep + 1 ..] else "";
+                try writer.print("identifier {s}'{s}'{s} contains redundant word {s}'{s}'{s}", .{ y, name, r, y, word, r });
             },
         }
     }
